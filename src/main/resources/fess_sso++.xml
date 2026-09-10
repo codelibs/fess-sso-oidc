@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE components PUBLIC "-//DBFLUTE//DTD LastaDi 1.0//EN"
+	"http://dbflute.org/meta/lastadi10.dtd">
+<components>
+	<!-- Merged into Fess's fess_sso.xml. SsoManager.getAuthenticator() looks the authenticator up
+	     as "<sso.type>Authenticator", so this component name is what makes sso.type=oic work. Note
+	     the spelling: the repository and the documentation say "oidc", the component name and the
+	     configuration value say "oic", and SsoManager maps no alias between the two.
+	     A "++" file is additive and is collected from every jar on the class path, so this does not
+	     collide with another fess-sso-* plugin contributing its own authenticator.
+
+	     Singleton, deliberately with no instance attribute: init() registers this instance with
+	     ssoManager, and a prototype would register a fresh one per lookup.
+
+	     No <property> here: every value this authenticator reads comes from an oic.* system
+	     property, so there is nothing left to set through DI. -->
+	<component name="oicAuthenticator" class="org.codelibs.fess.sso.oic.OpenIdConnectAuthenticator">
+	</component>
+</components>

@@ -1,0 +1,157 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<artifactId>fess-sso-oidc</artifactId>
+	<packaging>jar</packaging>
+	<name>OpenID Connect SSO Plugin</name>
+	<version>15.9.0-SNAPSHOT</version>
+	<description>OpenID Connect single sign-on for Fess: the authenticator behind sso.type=oic.</description>
+	<scm>
+		<connection>scm:git:git@github.com:codelibs/fess-sso-oidc.git</connection>
+		<developerConnection>scm:git:git@github.com:codelibs/fess-sso-oidc.git</developerConnection>
+		<url>https://github.com/codelibs/fess-sso-oidc</url>
+		<tag>HEAD</tag>
+	</scm>
+	<parent>
+		<groupId>org.codelibs.fess</groupId>
+		<artifactId>fess-parent</artifactId>
+		<version>15.9.0-SNAPSHOT</version>
+		<relativePath />
+	</parent>
+	<build>
+		<plugins>
+			<plugin>
+				<artifactId>maven-compiler-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<artifactId>maven-source-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<artifactId>maven-jar-plugin</artifactId>
+				<configuration>
+					<archive>
+						<manifest>
+							<addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+						</manifest>
+						<manifestEntries>
+							<!-- Mounts this jar into the webapp class loader (FessWebResourceRoot). The
+							     authenticator runs in the login flow: SsoAction and FessLoginAssist are
+							     webapp classes, so the webapp has to see it. No child process needs it,
+							     but they get WEB-INF/plugin on their class path regardless of this entry. -->
+							<Fess-WebAppJar>true</Fess-WebAppJar>
+						</manifestEntries>
+					</archive>
+				</configuration>
+			</plugin>
+			<!-- No maven-shade-plugin, unlike the other fess-sso-* plugins. Everything this
+			     authenticator compiles against stays in the war: google-oauth-client is a direct
+			     dependency of Fess, google-http-client and google-http-client-gson arrive there with
+			     google-api-client and google-auth-library-oauth2-http (kept to supply fess-ds-gsuite),
+			     and guava is used by Fess itself. `mvn dependency:list -DincludeScope=runtime` on this
+			     project therefore lists nothing, and a shade execution would have no artifact to
+			     bundle. Splitting this authenticator out does not make the distribution smaller; it
+			     only moves the code.
+			     If a third-party dependency is ever added here (the JWT signature validation the
+			     authenticator still has a TODO for would need one), add maven-shade-plugin back with
+			     an artifactSet exclude list; fess-sso-entraid's pom has the shape. An unshaded
+			     compile-scope dependency is not on any class path Fess builds: only WEB-INF/lib and
+			     the plugin jars themselves are, so it would fail at run time with
+			     NoClassDefFoundError. -->
+			<plugin>
+				<artifactId>maven-javadoc-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>com.mycila</groupId>
+				<artifactId>license-maven-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>net.revelc.code.formatter</groupId>
+				<artifactId>formatter-maven-plugin</artifactId>
+			</plugin>
+		</plugins>
+	</build>
+	<!-- Fess plugins are distributed through maven.codelibs.org instead of Maven Central.
+	     This cannot be inherited from fess-parent: distributionManagement is inherited
+	     unconditionally, so declaring it there would also redirect the SNAPSHOT
+	     deployments of fess-parent, fess, fess-crawler, fess-crawler-playwright and
+	     fess-suggest, which stay on Maven Central. The scpexe transport comes from
+	     the wagon-ssh-external build extension inherited from fess-parent. -->
+	<distributionManagement>
+		<repository>
+			<id>codelibs-repo</id>
+			<name>CodeLibs Repository</name>
+			<url>scpexe://maven.codelibs.org/var/www/maven/release</url>
+		</repository>
+		<snapshotRepository>
+			<id>codelibs-snapshots</id>
+			<name>CodeLibs Snapshot Repository</name>
+			<url>scpexe://maven.codelibs.org/var/www/maven/snapshot</url>
+		</snapshotRepository>
+	</distributionManagement>
+	<repositories>
+		<repository>
+			<id>snapshots.central.sonatype.com</id>
+			<url>https://central.sonatype.com/repository/maven-snapshots</url>
+			<releases>
+				<enabled>false</enabled>
+			</releases>
+			<snapshots>
+				<enabled>true</enabled>
+			</snapshots>
+		</repository>
+	</repositories>
+	<dependencies>
+		<!-- This one node supplies everything the authenticator and the credential compile
+		     against, and all of it as provided: google-oauth-client
+		     (com.google.api.client.auth.oauth2), google-http-client (com.google.api.client.http
+		     and .json), google-http-client-gson (the GsonFactory the JWT claim set is parsed with)
+		     and guava (com.google.common.io.BaseEncoding), on top of Fess's own SsoAuthenticator,
+		     FessCredential and ComponentUtil. Nothing is declared again below, so nothing ends up
+		     in this jar that the war already carries. -->
+		<dependency>
+			<groupId>org.codelibs.fess</groupId>
+			<artifactId>fess</artifactId>
+			<version>${fess.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<!-- @PostConstruct on init(), which is what registers this authenticator with
+			     ssoManager. Fess declares this provided too, and a provided dependency does not
+			     transit. -->
+			<groupId>jakarta.annotation</groupId>
+			<artifactId>jakarta.annotation-api</artifactId>
+			<version>${jakarta.annotation.api.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<!-- HttpServletRequest and HttpSession, for the state the authorization request is
+			     issued with and the callback is checked against. Tomcat supplies these at run time,
+			     and Fess declares the artifact provided, so it does not transit either. -->
+			<groupId>jakarta.servlet</groupId>
+			<artifactId>jakarta.servlet-api</artifactId>
+			<version>${jakarta.servlet.api.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-api</artifactId>
+			<version>${junit.jupiter.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-engine</artifactId>
+			<version>${junit.jupiter.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<!-- WebContainerTestCase and MockletHttpServletRequest, for the container the tests
+			     moved from Fess run in. Fess has the same test dependency, but a test-scope
+			     dependency does not transit. -->
+			<groupId>org.dbflute.utflute</groupId>
+			<artifactId>utflute-lastaflute</artifactId>
+			<version>${utflute.version}</version>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+</project>
