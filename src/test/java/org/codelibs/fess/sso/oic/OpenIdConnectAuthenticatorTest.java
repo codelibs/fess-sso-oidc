@@ -18,6 +18,7 @@ package org.codelibs.fess.sso.oic;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -471,6 +472,84 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final LoginCredential credential = authenticator.getLoginCredential();
         assertNotNull(credential);
         assertTrue(credential instanceof ActionResponseCredential);
+    }
+
+    // ===================================================================================
+    //                                                        Caller-supplied values in the log
+    //                                                        =================================
+
+    private static final String FORGED_LINE = "2000-01-01 00:00:00,000 [forged] ERROR org.codelibs.fess.Forged";
+
+    /** Returns every message this class logged while the callback below ran, one string per event. */
+    private List<String> loggedWhileHandling(final String state, final String code, final String error, final String errorDescription) {
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.setParameter("state", state);
+        if (code != null) {
+            request.setParameter("code", code);
+        }
+        if (error != null) {
+            request.setParameter("error", error);
+        }
+        if (errorDescription != null) {
+            request.setParameter("error_description", errorDescription);
+        }
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            authenticator.getLoginCredential();
+        } finally {
+            appender.detach();
+        }
+        final List<String> messages = new ArrayList<>();
+        for (final LogEvent event : appender.events()) {
+            messages.add(event.getMessage().getFormattedMessage());
+        }
+        return messages;
+    }
+
+    private void assertSingleLine(final List<String> messages) {
+        for (final String message : messages) {
+            assertFalse(message.matches("(?s).*[\\p{Cntrl}\\u0085\\u2028\\u2029].*"), "a line break reached the log: " + message);
+        }
+    }
+
+    @Test
+    public void test_getLoginCredential_providerErrorCannotStartALogLine() {
+        // The callback is anonymous: anyone with a session of their own can send a state that matches it
+        // together with an error, and the error text goes to the log at warn, which is on by default.
+        final List<String> messages = loggedWhileHandling("the-state", null, "access_denied\n" + FORGED_LINE,
+                "declined\r\n" + FORGED_LINE + "\u2028" + FORGED_LINE);
+
+        assertSingleLine(messages);
+        final String warn = String.join("\n", messages);
+        assertTrue(warn.contains("error=access_denied?" + FORGED_LINE), "the error was not logged");
+        assertTrue(warn.contains("error_description=declined??" + FORGED_LINE), "the error description was not logged");
+    }
+
+    @Test
+    public void test_getLoginCredential_callbackCodeAndStateCannotStartALogLine() {
+        final List<String> messages = loggedWhileHandling("the-state\n" + FORGED_LINE, "a-code\n" + FORGED_LINE, null, null);
+
+        assertSingleLine(messages);
+        assertTrue(String.join("\n", messages).contains("a-code?" + FORGED_LINE), "the code was not logged");
+    }
+
+    @Test
+    public void test_getLoginCredential_longProviderErrorIsCut() {
+        final List<String> messages = loggedWhileHandling("the-state", null, "access_denied", "x".repeat(10_000));
+
+        final String warn = String.join("\n", messages);
+        assertTrue(warn.length() < 1000, "a 10000 character error description was logged in full");
+        assertTrue(warn.contains("x".repeat(OpenIdConnectAuthenticator.MAX_LOGGED_LENGTH) + "..."), "the cut is not marked");
+    }
+
+    @Test
+    public void test_sanitizeForLog() {
+        assertNull(OpenIdConnectAuthenticator.sanitizeForLog(null));
+        assertEquals("", OpenIdConnectAuthenticator.sanitizeForLog(""));
+        assertEquals("access_denied", OpenIdConnectAuthenticator.sanitizeForLog("access_denied"));
+        assertEquals("a?b?c?d?e?f", OpenIdConnectAuthenticator.sanitizeForLog("a\nb\rc\u0085d\u2028e\u2029f"));
+        assertEquals("\u65e5\u672c\u8a9e", OpenIdConnectAuthenticator.sanitizeForLog("\u65e5\u672c\u8a9e"));
     }
 
     // ===================================================================================

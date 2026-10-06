@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -96,6 +97,12 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     /** Configuration key for OpenID Connect base URL. */
     protected static final String OIC_BASE_URL = "oic.base.url";
 
+    /** The longest request value written to the log as is; a longer one is cut. */
+    protected static final int MAX_LOGGED_LENGTH = 100;
+
+    /** Control characters, and the Unicode line and paragraph separators that {@code \p{Cntrl}} does not cover. */
+    private static final Pattern UNSAFE_LOG_CHARS = Pattern.compile("[\\p{Cntrl}\\u0085\\u2028\\u2029]");
+
     /** HTTP transport for OpenID Connect requests. */
     protected final HttpTransport httpTransport = new NetHttpTransport();
 
@@ -127,7 +134,8 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                     final String code = request.getParameter("code");
                     final String reqState = request.getParameter("state");
                     if (logger.isDebugEnabled()) {
-                        logger.debug("code: {}, state(request): {}, state(session): {}", code, reqState, sesState);
+                        logger.debug("code: {}, state(request): {}, state(session): {}", sanitizeForLog(code), sanitizeForLog(reqState),
+                                sesState);
                     }
                     if (sesState.equals(reqState)) {
                         final String error = request.getParameter("error");
@@ -138,8 +146,8 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                             // refusing, or hand back a code and log the user in anyway, when it refuses only
                             // because the user declined the consent. Report it instead, so the caller shows
                             // the login error.
-                            logger.warn("The OpenID provider rejected the authorization request: error={}, error_description={}", error,
-                                    request.getParameter("error_description"));
+                            logger.warn("The OpenID provider rejected the authorization request: error={}, error_description={}",
+                                    sanitizeForLog(error), sanitizeForLog(request.getParameter("error_description")));
                             return null;
                         }
                         if (StringUtil.isNotBlank(code)) {
@@ -151,6 +159,22 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
 
             return new ActionResponseCredential(() -> HtmlResponse.fromRedirectPathAsIs(getAuthUrl(request)));
         }).orElse(null);
+    }
+
+    /**
+     * Makes a request parameter safe to embed in a log message. The callback endpoint is anonymous and the
+     * application log is one event per line, so a line break in a logged value would let any caller start a
+     * log line of their own. Control characters are replaced by {@code ?} and a longer value is cut.
+     *
+     * @param value the request parameter (may be null)
+     * @return the value to log, or null if the value is null
+     */
+    protected static String sanitizeForLog(final String value) {
+        if (value == null) {
+            return null;
+        }
+        final String bounded = value.length() > MAX_LOGGED_LENGTH ? value.substring(0, MAX_LOGGED_LENGTH) + "..." : value;
+        return UNSAFE_LOG_CHARS.matcher(bounded).replaceAll("?");
     }
 
     /**
