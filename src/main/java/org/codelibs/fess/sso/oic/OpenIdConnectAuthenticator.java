@@ -16,12 +16,14 @@
 package org.codelibs.fess.sso.oic;
 
 import java.io.IOException;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
 import org.apache.logging.log4j.LogManager;
@@ -97,11 +99,23 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     /** Configuration key for OpenID Connect base URL. */
     protected static final String OIC_BASE_URL = "oic.base.url";
 
+    /** Configuration key for the issuer identifier the ID token's {@code iss} claim is compared with. */
+    protected static final String OIC_ISSUER = "oic.issuer";
+
+    /** The clock difference, in seconds, tolerated between this host and the provider when {@code exp} is checked. */
+    protected static final long CLOCK_SKEW_SECONDS = 300;
+
     /** The longest request value written to the log as is; a longer one is cut. */
     protected static final int MAX_LOGGED_LENGTH = 100;
 
     /** Control characters, and the Unicode line and paragraph separators that {@code \p{Cntrl}} does not cover. */
     private static final Pattern UNSAFE_LOG_CHARS = Pattern.compile("[\\p{Cntrl}\\u0085\\u2028\\u2029]");
+
+    /** A dotted-quad address in 127.0.0.0/8, each octet in decimal without leading zeros. */
+    private static final Pattern LOOPBACK_IPV4 = Pattern.compile("127(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}");
+
+    /** Set once the log has said that {@code oic.issuer} is not configured. */
+    private final AtomicBoolean issuerNotConfiguredLogged = new AtomicBoolean();
 
     /** HTTP transport for OpenID Connect requests. */
     protected final HttpTransport httpTransport = new NetHttpTransport();
@@ -257,10 +271,12 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                 logger.debug("jwtSignature: {} encoded characters, not validated", jwt[2].length());
             }
 
-            // SECURITY WARNING: JWT signature validation is not implemented.
-            // This is a critical security vulnerability. The ID token should be validated
-            // to ensure it was issued by the expected OpenID Connect provider and has not been tampered with.
-            // TODO: Implement JWT signature validation using the provider's public key
+            // The signature is deliberately not verified. This id_token was not handed over by the
+            // browser: it came straight from the provider's token endpoint in the response to our own
+            // request, and OpenID Connect Core 3.1.3.7 (item 6) lets the TLS server validation of that
+            // exchange stand in for the signature check. That is why getTokenUrl insists on https.
+            // What the specification still requires of the claims -- aud, azp, exp and, when oic.issuer
+            // is set, iss -- is checked in validateIdTokenClaims below.
 
             final Map<String, Object> attributes = new HashMap<>();
             attributes.put("accesstoken", tr.getAccessToken());
@@ -280,6 +296,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                         tr.getRefreshToken() == null ? "absent" : "present");
             }
             parseJwtClaim(jwtClaim, attributes);
+            validateIdTokenClaims(attributes, System.currentTimeMillis() / 1000);
 
             final OpenIdConnectCredential credential = new OpenIdConnectCredential(attributes);
             if (StringUtil.isBlank(credential.getUserId())) {
@@ -300,6 +317,79 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             }
         }
         return null;
+    }
+
+    /**
+     * Checks the claims of the ID token that OpenID Connect Core 3.1.3.7 requires of a client that
+     * has received the token directly from the token endpoint: {@code iss} (only when
+     * {@code oic.issuer} is set), {@code aud}, {@code azp} and {@code exp}. A claim of an unexpected
+     * type is a failed check, never an exception of another kind.
+     *
+     * <ul>
+     * <li>{@code iss}: when {@code oic.issuer} is set, the claim must equal it exactly. When it is
+     * not set the check is skipped, and the log says so once per authenticator.</li>
+     * <li>{@code aud}: a string or an array of strings that contains the configured client id.
+     * Without a configured client id nothing can match, so the token is refused.</li>
+     * <li>{@code azp}: when present, it must be the client id. A token that lists more than one
+     * audience must carry it.</li>
+     * <li>{@code exp}: required, and a number. The token is accepted while
+     * {@code nowSeconds < exp + CLOCK_SKEW_SECONDS}.</li>
+     * </ul>
+     *
+     * @param claims the claim set of the ID token
+     * @param nowSeconds the current time, in seconds since the epoch
+     * @throws IllegalArgumentException if a check fails; the message names the reason
+     */
+    protected void validateIdTokenClaims(final Map<String, Object> claims, final long nowSeconds) {
+        final String expectedIssuer = getOicIssuer();
+        if (StringUtil.isBlank(expectedIssuer)) {
+            if (issuerNotConfiguredLogged.compareAndSet(false, true)) {
+                logger.warn("{} is not set, so the iss claim of the ID token is not checked. Set it to the issuer value of the"
+                        + " provider's /.well-known/openid-configuration.", OIC_ISSUER);
+            }
+        } else if (!expectedIssuer.equals(claims.get("iss"))) {
+            throw new IllegalArgumentException("The ID token was not issued by the configured issuer: iss="
+                    + sanitizeForLog(String.valueOf(claims.get("iss"))) + ", " + OIC_ISSUER + "=" + sanitizeForLog(expectedIssuer));
+        }
+
+        final String clientId = getOicClientId();
+        if (StringUtil.isBlank(clientId)) {
+            throw new IllegalArgumentException(OIC_CLIENT_ID + " is not set, so the audience of the ID token cannot be checked.");
+        }
+        final Object aud = claims.get("aud");
+        final List<String> audiences = new ArrayList<>();
+        if (aud instanceof final String single) {
+            audiences.add(single);
+        } else if (aud instanceof final List<?> list) {
+            for (final Object element : list) {
+                if (element instanceof final String audience) {
+                    audiences.add(audience);
+                }
+            }
+        }
+        if (!audiences.contains(clientId)) {
+            throw new IllegalArgumentException("The ID token was not issued for this client: aud=" + sanitizeForLog(String.valueOf(aud))
+                    + ", " + OIC_CLIENT_ID + "=" + sanitizeForLog(clientId));
+        }
+
+        final Object azp = claims.get("azp");
+        if (azp != null && !clientId.equals(azp)) {
+            throw new IllegalArgumentException(
+                    "The ID token was issued to another authorized party: azp=" + sanitizeForLog(String.valueOf(azp)));
+        }
+        if (azp == null && aud instanceof final List<?> list && list.size() > 1) {
+            throw new IllegalArgumentException("The ID token lists several audiences but has no azp claim.");
+        }
+
+        if (!(claims.get("exp") instanceof final Number exp)) {
+            throw new IllegalArgumentException("The ID token has no numeric exp claim.");
+        }
+        // Compared as doubles: a Long near Long.MAX_VALUE plus the skew would wrap around. The negated
+        // form also refuses NaN.
+        if (!(nowSeconds < exp.doubleValue() + CLOCK_SKEW_SECONDS)) {
+            throw new IllegalArgumentException(
+                    "The ID token has expired: exp=" + exp + ", now=" + nowSeconds + ", allowed clock skew=" + CLOCK_SKEW_SECONDS + "s.");
+        }
     }
 
     /**
@@ -389,14 +479,56 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      * @param code the authorization code
      * @return the token response
      * @throws IOException if an I/O error occurs
+     * @throws IllegalArgumentException if the token server URL is not acceptable, see {@link #requireSecureTokenEndpoint(String)}
      */
     protected TokenResponse getTokenUrl(final String code) throws IOException {
-        return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, new GenericUrl(getOicTokenServerUrl()), code)//
+        final String tokenServerUrl = getOicTokenServerUrl();
+        requireSecureTokenEndpoint(tokenServerUrl);
+        return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, new GenericUrl(tokenServerUrl), code)//
                 .setGrantType("authorization_code")//
                 .setRedirectUri(getOicRedirectUrl())//
                 .set("client_id", getOicClientId())//
                 .set("client_secret", getOicClientSecret())//
                 .execute();
+    }
+
+    /**
+     * Refuses a token endpoint that is not reached over TLS. The ID token is not signature-checked
+     * because it comes straight from this endpoint (see {@link #processCallback}), and the client
+     * secret is sent to it, so a plain http endpoint would leave both unprotected. {@code http} is
+     * accepted only when the host is the literal {@code localhost}, an address in 127.0.0.0/8 or
+     * {@code ::1}, for a provider on the same machine; nothing is resolved to decide that.
+     *
+     * @param url the token endpoint URL (may be null)
+     * @throws IllegalArgumentException if the URL is not https, or http for another host; the
+     *         message does not repeat the URL, which may carry credentials
+     */
+    protected void requireSecureTokenEndpoint(final String url) {
+        if (!isSecureTokenEndpoint(url)) {
+            throw new IllegalArgumentException(
+                    OIC_TOKEN_SERVER_URL + " must be https (http is accepted only for localhost, 127.x.x.x and ::1)");
+        }
+    }
+
+    private static boolean isSecureTokenEndpoint(final String url) {
+        if (url == null) {
+            return false;
+        }
+        final URI uri;
+        try {
+            // java.net.URL, which GenericUrl uses, ignores leading and trailing whitespace; so does this.
+            uri = URI.create(url.trim());
+        } catch (final IllegalArgumentException e) {
+            // Dropped, not chained: the parser's message repeats the URL, which may carry credentials.
+            return false;
+        }
+        final String scheme = uri.getScheme();
+        if ("https".equalsIgnoreCase(scheme)) {
+            return true;
+        }
+        final String host = uri.getHost();
+        return "http".equalsIgnoreCase(scheme) && host != null && ("localhost".equalsIgnoreCase(host) || "[::1]".equals(host)
+                || "::1".equals(host) || LOOPBACK_IPV4.matcher(host).matches());
     }
 
     /**
@@ -462,6 +594,15 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      */
     protected String getOicClientId() {
         return ComponentUtil.getSystemProperties().getProperty(OIC_CLIENT_ID, StringUtil.EMPTY);
+    }
+
+    /**
+     * Gets the issuer identifier the ID token's {@code iss} claim has to equal.
+     *
+     * @return the issuer, trimmed; empty when the check is not configured
+     */
+    protected String getOicIssuer() {
+        return ComponentUtil.getSystemProperties().getProperty(OIC_ISSUER, StringUtil.EMPTY).trim();
     }
 
     /**

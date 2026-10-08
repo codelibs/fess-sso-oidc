@@ -17,8 +17,12 @@ package org.codelibs.fess.sso.oic;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -35,11 +39,13 @@ import org.codelibs.fess.unit.LogCapturingAppender;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
 import org.dbflute.utflute.mocklet.MockletHttpServletRequest;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.lastaflute.web.login.credential.LoginCredential;
 
 import com.google.api.client.auth.oauth2.TokenResponse;
+import com.sun.net.httpserver.HttpServer;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -347,8 +353,27 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(json.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String jwtOf(final String claimJson) {
+    /** The client id every authenticator built by {@link #authenticatorReturning} is configured with. */
+    private static final String CLIENT_ID = "test-client";
+
+    /** 2100-01-01 in seconds since the epoch: a token that is not expired by the time anyone runs this. */
+    private static final long FAR_FUTURE_EXP = 4102444800L;
+
+    /** Builds a JWT without adding anything to the claim set: for tests of what a token that lacks a claim does. */
+    private static String bareJwtOf(final String claimJson) {
         return segment("{\"alg\":\"RS256\"}") + "." + segment(claimJson) + "." + segment("signature");
+    }
+
+    /**
+     * Builds a JWT whose claim set is valid for {@link #CLIENT_ID} unless the test says otherwise: {@code aud} and a
+     * far-future {@code exp} are put in front of the given claims, and a key the test gives again wins because the
+     * parser keeps the last value of a repeated key. Without them every token below would be refused for the missing
+     * audience, and the tests of the email claim and of the debug log would pass without testing what they are named for.
+     */
+    private static String jwtOf(final String claimJson) {
+        final String rest = claimJson.trim().substring(1).trim();
+        final String defaults = "{\"aud\":\"" + CLIENT_ID + "\",\"exp\":" + FAR_FUTURE_EXP;
+        return bareJwtOf(defaults + ("}".equals(rest) ? "}" : "," + rest));
     }
 
     private static TokenResponse tokenResponseWith(final Object idToken) {
@@ -363,10 +388,24 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     }
 
     private OpenIdConnectAuthenticator authenticatorReturning(final TokenResponse tr) {
+        return authenticatorReturning(tr, "");
+    }
+
+    private OpenIdConnectAuthenticator authenticatorReturning(final TokenResponse tr, final String issuer) {
         return new OpenIdConnectAuthenticator() {
             @Override
             protected TokenResponse getTokenUrl(final String code) {
                 return tr;
+            }
+
+            @Override
+            protected String getOicClientId() {
+                return CLIENT_ID;
+            }
+
+            @Override
+            protected String getOicIssuer() {
+                return issuer;
             }
         };
     }
@@ -586,7 +625,9 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         tr.setExpiresInSeconds(300L);
         // A signature is raw bytes; these are not valid UTF-8 text.
         final byte[] signature = { 0x00, 0x01, (byte) 0xC3, (byte) 0x28, (byte) 0xA0, (byte) 0xA1, 0x07 };
-        tr.set("id_token", segment("{\"alg\":\"RS256\"}") + "." + segment("{\"email\":\"user@example.com\"}") + "." + segment(signature));
+        // The claim set is valid for the client, so the whole callback runs and not only the part before the claim checks.
+        final String claims = "{\"aud\":\"" + CLIENT_ID + "\",\"exp\":" + FAR_FUTURE_EXP + ",\"email\":\"user@example.com\"}";
+        tr.set("id_token", segment("{\"alg\":\"RS256\"}") + "." + segment(claims) + "." + segment(signature));
         return tr;
     }
 
@@ -612,5 +653,586 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         assertFalse(output.contains("\u0000"), "a NUL byte reached the log");
         assertFalse(output.contains("\u0007"), "a control byte reached the log");
         assertFalse(output.contains("\ufffd"), "an undecodable byte reached the log");
+    }
+
+    // ===================================================================================
+    //                                                                   Claim validation
+    //                                                                   ================
+
+    private static final long NOW = 1_700_000_000L;
+
+    private static final String ISSUER = "https://idp.example.com/realms/fess";
+
+    private static OpenIdConnectAuthenticator validatorFor(final String clientId, final String issuer) {
+        return new OpenIdConnectAuthenticator() {
+            @Override
+            protected String getOicClientId() {
+                return clientId;
+            }
+
+            @Override
+            protected String getOicIssuer() {
+                return issuer;
+            }
+        };
+    }
+
+    /** The claims of a token that is acceptable for {@link #CLIENT_ID} at {@link #NOW}; a test changes the one it is about. */
+    private static Map<String, Object> validClaims() {
+        final Map<String, Object> claims = new HashMap<>();
+        claims.put("aud", CLIENT_ID);
+        claims.put("exp", NOW + 3600);
+        return claims;
+    }
+
+    /** Runs the check with no issuer configured, which is the default. */
+    private static void validate(final Map<String, Object> claims) {
+        validatorFor(CLIENT_ID, "").validateIdTokenClaims(claims, NOW);
+    }
+
+    /** Returns the reason of the rejection, and fails if there was none or if it was not an IllegalArgumentException. */
+    private static String rejectionOf(final OpenIdConnectAuthenticator authenticator, final Map<String, Object> claims) {
+        return Assertions.assertThrows(IllegalArgumentException.class, () -> authenticator.validateIdTokenClaims(claims, NOW)).getMessage();
+    }
+
+    private static String rejectionOf(final Map<String, Object> claims) {
+        return rejectionOf(validatorFor(CLIENT_ID, ""), claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_audienceAsString() {
+        validate(validClaims());
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_audienceAsArrayContainingTheClient() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", Arrays.asList("another-client", CLIENT_ID));
+        claims.put("azp", CLIENT_ID);
+        validate(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_missingAudience() {
+        final Map<String, Object> claims = validClaims();
+        claims.remove("aud");
+        assertTrue(rejectionOf(claims).contains("not issued for this client"), "the reason names the audience");
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_emptyAudienceArray() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", new ArrayList<>());
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_audienceOfAnotherClient() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", "another-client");
+        final String reason = rejectionOf(claims);
+        assertTrue(reason.contains("aud=another-client"), "the reason prints the audience: " + reason);
+        assertTrue(reason.contains("oic.client.id=" + CLIENT_ID), "the reason prints the expected client id: " + reason);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_audienceArrayWithoutTheClient() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", Arrays.asList("a", "b"));
+        claims.put("azp", "a");
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_audienceOfAnotherType() {
+        // A claim set is whatever the provider sent: none of these may end in a ClassCastException.
+        final List<Object> unusable = new ArrayList<>();
+        unusable.add(42L);
+        unusable.add(true);
+        unusable.add(new HashMap<String, Object>());
+        unusable.add(null);
+        unusable.add(Arrays.asList(CLIENT_ID));
+        for (final Object aud : Arrays.asList(Long.valueOf(42), Boolean.TRUE, new HashMap<String, Object>(), unusable)) {
+            final Map<String, Object> claims = validClaims();
+            claims.put("aud", aud);
+            rejectionOf(claims);
+        }
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", null);
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_blankClientIdRefusesEveryToken() {
+        // Fail closed: an unset oic.client.id must not turn into "any audience will do".
+        for (final String clientId : new String[] { "", "   " }) {
+            final Map<String, Object> claims = validClaims();
+            claims.put("aud", clientId);
+            final String reason = rejectionOf(validatorFor(clientId, ""), claims);
+            assertTrue(reason.contains("oic.client.id is not set"), "the reason names the setting: " + reason);
+        }
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_severalAudiencesWithAzp() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", Arrays.asList(CLIENT_ID, "resource-server"));
+        claims.put("azp", CLIENT_ID);
+        validate(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_severalAudiencesWithoutAzp() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("aud", Arrays.asList(CLIENT_ID, "resource-server"));
+        final String reason = rejectionOf(claims);
+        assertTrue(reason.contains("azp"), "the reason names azp: " + reason);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_azpOfAnotherClient() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("azp", "another-client");
+        final String reason = rejectionOf(claims);
+        assertTrue(reason.contains("azp=another-client"), "the reason prints azp: " + reason);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_azpOfTheClientWithOneAudience() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("azp", CLIENT_ID);
+        validate(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_azpThatIsNotAString() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("azp", Long.valueOf(7));
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_missingExpiry() {
+        final Map<String, Object> claims = validClaims();
+        claims.remove("exp");
+        assertTrue(rejectionOf(claims).contains("exp"), "the reason names exp");
+        claims.put("exp", null);
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_expiryThatIsNotANumber() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("exp", "123");
+        rejectionOf(claims);
+        claims.put("exp", Boolean.TRUE);
+        rejectionOf(claims);
+        claims.put("exp", Arrays.asList(NOW + 3600));
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_expiredWithinTheClockSkew() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("exp", NOW - (OpenIdConnectAuthenticator.CLOCK_SKEW_SECONDS - 1));
+        validate(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_expiredAtTheEndOfTheClockSkew() {
+        // The boundary is exclusive: now == exp + skew is already refused.
+        final Map<String, Object> claims = validClaims();
+        claims.put("exp", NOW - OpenIdConnectAuthenticator.CLOCK_SKEW_SECONDS);
+        final String reason = rejectionOf(claims);
+        assertTrue(reason.contains("exp=" + (NOW - 300)), "the reason prints exp: " + reason);
+        assertTrue(reason.contains("now=" + NOW), "the reason prints the current time: " + reason);
+        assertTrue(reason.contains("skew=300"), "the reason prints the skew: " + reason);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_expiredBeyondTheClockSkew() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("exp", NOW - (OpenIdConnectAuthenticator.CLOCK_SKEW_SECONDS + 1));
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_expiryAsDouble() {
+        // The JSON parser answers a Double for a number written with a fraction or an exponent.
+        final Map<String, Object> claims = validClaims();
+        claims.put("exp", NOW + 3600.0);
+        validate(claims);
+        claims.put("exp", NOW - 301.0);
+        rejectionOf(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_expiryOfLongMaxValue() {
+        // Long.MAX_VALUE + skew wraps around in long arithmetic and would read as already expired.
+        final Map<String, Object> claims = validClaims();
+        claims.put("exp", Long.MAX_VALUE);
+        validate(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_noIssuerConfigured() {
+        // Without oic.issuer the claim is not checked: a token without one, or with any value, passes.
+        validate(validClaims());
+        final Map<String, Object> claims = validClaims();
+        claims.put("iss", "https://anything.example.com");
+        validate(claims);
+        claims.put("iss", Long.valueOf(1));
+        validate(claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_issuerEqualToTheConfiguredOne() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("iss", ISSUER);
+        validatorFor(CLIENT_ID, ISSUER).validateIdTokenClaims(claims, NOW);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_issuerOfAnotherProvider() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("iss", "https://other.example.com");
+        final String reason = rejectionOf(validatorFor(CLIENT_ID, ISSUER), claims);
+        assertTrue(reason.contains("iss=https://other.example.com"), "the reason prints iss: " + reason);
+        assertTrue(reason.contains("oic.issuer=" + ISSUER), "the reason prints the configured issuer: " + reason);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_missingIssuerWhenConfigured() {
+        rejectionOf(validatorFor(CLIENT_ID, ISSUER), validClaims());
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_issuerThatIsNotAString() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("iss", Arrays.asList(ISSUER));
+        rejectionOf(validatorFor(CLIENT_ID, ISSUER), claims);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_issuerIsComparedExactly() {
+        // No normalisation: the value is the issuer identifier and the provider's metadata says what it is.
+        final Map<String, Object> claims = validClaims();
+        claims.put("iss", ISSUER + "/");
+        rejectionOf(validatorFor(CLIENT_ID, ISSUER), claims);
+        claims.put("iss", ISSUER);
+        rejectionOf(validatorFor(CLIENT_ID, ISSUER + "/"), claims);
+        claims.put("iss", ISSUER.replace("https://", "http://"));
+        rejectionOf(validatorFor(CLIENT_ID, ISSUER), claims);
+        claims.put("iss", ISSUER.toUpperCase());
+        rejectionOf(validatorFor(CLIENT_ID, ISSUER), claims);
+    }
+
+    @Test
+    public void test_getOicIssuer() {
+        assertEquals("", authenticator.getOicIssuer());
+        // The component outlives this test, so the key is set on the one the code reads and removed again.
+        final DynamicProperties properties = ComponentUtil.getSystemProperties();
+        properties.setProperty(OpenIdConnectAuthenticator.OIC_ISSUER, "  " + ISSUER + " \t");
+        try {
+            assertEquals(ISSUER, authenticator.getOicIssuer());
+        } finally {
+            properties.remove(OpenIdConnectAuthenticator.OIC_ISSUER);
+        }
+        assertEquals("", authenticator.getOicIssuer());
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_missingIssuerSettingIsLoggedOncePerAuthenticator() {
+        final OpenIdConnectAuthenticator first = validatorFor(CLIENT_ID, "");
+        final OpenIdConnectAuthenticator second = validatorFor(CLIENT_ID, "");
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            first.validateIdTokenClaims(validClaims(), NOW);
+            first.validateIdTokenClaims(validClaims(), NOW);
+            assertEquals(1, appender.warnings().size(), "the second validation logged again");
+            second.validateIdTokenClaims(validClaims(), NOW);
+            assertEquals(2, appender.warnings().size(), "another authenticator is its own instance");
+        } finally {
+            appender.detach();
+        }
+        final String warning = appender.warnings().get(0);
+        assertTrue(warning.contains("oic.issuer is not set"), "the setting is not named: " + warning);
+        assertTrue(warning.contains("/.well-known/openid-configuration"), "the source of the value is not named: " + warning);
+    }
+
+    @Test
+    public void test_validateIdTokenClaims_configuredIssuerLogsNothing() {
+        final Map<String, Object> claims = validClaims();
+        claims.put("iss", ISSUER);
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            validatorFor(CLIENT_ID, ISSUER).validateIdTokenClaims(claims, NOW);
+        } finally {
+            appender.detach();
+        }
+        assertTrue(appender.warnings().isEmpty(), "a warning was logged: " + appender.warnings());
+    }
+
+    // ===================================================================================
+    //                                                          Token endpoint transport
+    //                                                          ========================
+
+    private static final String ENDPOINT_REFUSAL =
+            "oic.token.server.url must be https (http is accepted only for localhost, 127.x.x.x and ::1)";
+
+    private void assertAccepted(final String... urls) {
+        for (final String url : urls) {
+            try {
+                authenticator.requireSecureTokenEndpoint(url);
+            } catch (final IllegalArgumentException e) {
+                fail(url + " was refused: " + e.getMessage());
+            }
+        }
+    }
+
+    private void assertRefused(final String... urls) {
+        for (final String url : urls) {
+            final IllegalArgumentException e =
+                    Assertions.assertThrows(IllegalArgumentException.class, () -> authenticator.requireSecureTokenEndpoint(url), url);
+            assertEquals(ENDPOINT_REFUSAL, e.getMessage());
+        }
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_https() {
+        assertAccepted("https://idp.example.com/token", "HTTPS://IDP.EXAMPLE.COM/token", "https://idp.example.com:8443/realms/x/token",
+                "https://accounts.google.com/o/oauth2/token");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_httpsWithAHostJavaCannotParseAsOne() {
+        // java.net.URI reports no host for a name with an underscore, which is common for container service names.
+        assertAccepted("https://idp_internal:8443/token");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_surroundingWhitespaceIsIgnored() {
+        // As java.net.URL, which the request is built from, ignores it.
+        assertAccepted(" https://idp.example.com/token\n", "\thttp://localhost:8180/token ");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_httpToAnotherHost() {
+        assertRefused("http://example.com/token", "http://idp.example.com:8180/token", "HTTP://IDP.EXAMPLE.COM/token",
+                "http://10.0.0.5/token", "http://0.0.0.0:8180/token", "http://192.168.1.10/token");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_httpToThisMachine() {
+        assertAccepted("http://localhost/token", "http://localhost:8180/token", "http://LOCALHOST:8180/token", "http://127.0.0.1/token",
+                "http://127.0.0.1:8180/realms/x/token", "http://127.1.2.3:8180/token", "http://[::1]/token", "http://[::1]:8180/token",
+                "HTTP://localhost:8180/token");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_lookAlikesOfThisMachine() {
+        // Only the literal host counts. Each of these names or ends up at another machine.
+        assertRefused("http://localhost@evil.example.com", "http://localhost@evil.example.com/token",
+                "http://localhost:8180@evil.example.com/token", "http://127.0.0.1@evil.example.com/token",
+                "http://127.0.0.1.evil.example.com", "http://localhost.evil.example.com", "http://evil.example.com/localhost",
+                "http://evil.example.com/?u=localhost", "http://evil.example.com#@localhost", "http://127.1", "http://127.0.1",
+                "http://127.0.0.256", "http://127.0.0.01", "http://[::2]/token", "http://[::1].evil.example.com/token",
+                "http://idp.localhost:8180/token", "http://localhost./token");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_notAnAbsoluteHttpUrl() {
+        assertRefused(null, "", "   ", "/oauth2/token", "idp.example.com/token", "//idp.example.com/token", "ftp://idp.example.com/token",
+                "ftp://localhost/token", "file:///etc/passwd", "javascript:alert(1)", "http://", "http:///token", "https:", "://x");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_malformedUrl() {
+        assertRefused("http://exa mple.com/token", "https://idp.example.com/to ken", "http://localhost\\@evil.example.com",
+                "https://[::1/token");
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_refusalDoesNotRepeatTheUrl() {
+        // The URL may carry a user name and password (https://user:secret@host/), and the message is logged.
+        for (final String url : new String[] { "http://user:s3cr3t@idp.example.com/token", "ftp://user:s3cr3t@idp.example.com/token",
+                "http://user:s3cr3t@idp.example.com/to ken", "user:s3cr3t@idp.example.com/token" }) {
+            final IllegalArgumentException e =
+                    Assertions.assertThrows(IllegalArgumentException.class, () -> authenticator.requireSecureTokenEndpoint(url));
+            assertFalse(e.getMessage().contains("s3cr3t"), "the message repeats the URL: " + e.getMessage());
+            assertFalse(e.getMessage().contains("idp.example.com"), "the message repeats the URL: " + e.getMessage());
+            assertNull(e.getCause(), "a cause would carry the parser's message, which repeats the URL");
+        }
+    }
+
+    private static OpenIdConnectAuthenticator authenticatorWithTokenEndpoint(final String url) {
+        return new OpenIdConnectAuthenticator() {
+            @Override
+            protected String getOicTokenServerUrl() {
+                return url;
+            }
+
+            @Override
+            protected String getOicClientId() {
+                return CLIENT_ID;
+            }
+        };
+    }
+
+    @Test
+    public void test_getTokenUrl_refusesAPlainHttpEndpointBeforeAnyRequest() {
+        // The refusal is an IllegalArgumentException. A request to the host would have ended as an IOException
+        // (no such host, connection refused) or as a response, so this proves the check comes first.
+        final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("http://idp.invalid/token");
+        Assertions.assertThrows(IllegalArgumentException.class, () -> remote.getTokenUrl("the-code"));
+    }
+
+    @Test
+    public void test_processCallback_withAPlainHttpTokenEndpoint() {
+        final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("http://user:s3cr3t@idp.invalid/token");
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            assertNull(remote.processCallback(getMockRequest(), "the-code"));
+        } finally {
+            appender.detach();
+        }
+        final String warnings = String.join("\n", appender.warnings());
+        assertTrue(warnings.contains("Failed to process the OpenID Connect callback: " + ENDPOINT_REFUSAL), "no warning: " + warnings);
+        assertFalse(warnings.contains("s3cr3t"), "the URL was logged: " + warnings);
+    }
+
+    @Test
+    public void test_processCallback_overPlainHttpToTheLoopbackAddress() throws IOException {
+        // The accepted http endpoint is really reached: a token endpoint on 127.0.0.1, answering as a provider does.
+        final String body = "{\"access_token\":\"access-token\",\"token_type\":\"Bearer\",\"expires_in\":300,\"id_token\":\""
+                + jwtOf("{\"email\":\"user@example.com\"}") + "\"}";
+        final HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0);
+        server.createContext("/token", exchange -> {
+            final byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        server.start();
+        try {
+            final OpenIdConnectAuthenticator local =
+                    authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
+            final LoginCredential credential = local.processCallback(getMockRequest(), "the-code");
+            assertNotNull(credential);
+            assertEquals("{user@example.com}", credential.toString());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // ===================================================================================
+    //                                                    Claim validation in the callback
+    //                                                    ================================
+
+    private List<String> loggedByCallback(final OpenIdConnectAuthenticator authenticator, final LoginCredential[] result) {
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            result[0] = authenticator.processCallback(getMockRequest(), "the-code");
+        } finally {
+            appender.detach();
+        }
+        final List<String> messages = new ArrayList<>();
+        for (final LogEvent event : appender.events()) {
+            messages.add(event.getMessage().getFormattedMessage());
+        }
+        return messages;
+    }
+
+    @Test
+    public void test_processCallback_acceptsATokenIssuedForTheClient() {
+        // The positive control of the tests below: the same call with only the claim under test changed.
+        final LoginCredential[] result = new LoginCredential[1];
+        final List<String> messages = loggedByCallback(
+                authenticatorReturning(tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"iss\":\"" + ISSUER + "\"}")), ISSUER),
+                result);
+        assertNotNull(result[0]);
+        assertEquals("{user@example.com}", result[0].toString());
+        assertFalse(String.join("\n", messages).contains("Failed to process"), "a failure was logged: " + messages);
+    }
+
+    @Test
+    public void test_processCallback_withTheAudienceOfAnotherClient() {
+        final LoginCredential[] result = new LoginCredential[1];
+        final List<String> messages = loggedByCallback(
+                authenticatorReturning(tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"aud\":\"another-client\"}"))), result);
+        assertNull(result[0]);
+        assertTrue(messages.contains("Failed to process the OpenID Connect callback: The ID token was not issued for this client:"
+                + " aud=another-client, oic.client.id=test-client"), "the warning differs: " + messages);
+    }
+
+    @Test
+    public void test_processCallback_withAnExpiredToken() {
+        final LoginCredential[] result = new LoginCredential[1];
+        final List<String> messages = loggedByCallback(
+                authenticatorReturning(tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"exp\":1700000000}"))), result);
+        assertNull(result[0]);
+        assertTrue(String.join("\n", messages).contains("The ID token has expired: exp=1700000000, now="),
+                "the warning differs: " + messages);
+    }
+
+    @Test
+    public void test_processCallback_withoutExpiry() {
+        assertNull(callbackWith(bareJwtOf("{\"aud\":\"" + CLIENT_ID + "\",\"email\":\"user@example.com\"}")));
+    }
+
+    @Test
+    public void test_processCallback_withoutAudience() {
+        assertNull(callbackWith(bareJwtOf("{\"exp\":" + FAR_FUTURE_EXP + ",\"email\":\"user@example.com\"}")));
+    }
+
+    @Test
+    public void test_processCallback_withAudienceOfAnotherType() {
+        // The claim set comes from the provider: a number where a string is expected must end as a refusal.
+        assertNull(callbackWith(jwtOf("{\"email\":\"user@example.com\",\"aud\":7}")));
+        assertNull(callbackWith(jwtOf("{\"email\":\"user@example.com\",\"aud\":{\"a\":1}}")));
+        assertNull(callbackWith(jwtOf("{\"email\":\"user@example.com\",\"exp\":\"soon\"}")));
+        assertNull(callbackWith(jwtOf("{\"email\":\"user@example.com\",\"azp\":[\"" + CLIENT_ID + "\"]}")));
+    }
+
+    @Test
+    public void test_processCallback_withoutAConfiguredClientId() {
+        // authenticator itself reads oic.client.id from the (empty) system properties.
+        final TokenResponse tr = tokenResponseWith(jwtOf("{\"email\":\"user@example.com\"}"));
+        final OpenIdConnectAuthenticator unconfigured = new OpenIdConnectAuthenticator() {
+            @Override
+            protected TokenResponse getTokenUrl(final String code) {
+                return tr;
+            }
+        };
+        assertNull(unconfigured.processCallback(getMockRequest(), "the-code"));
+    }
+
+    @Test
+    public void test_processCallback_withTheIssuerOfAnotherProvider() {
+        final TokenResponse tr = tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"iss\":\"https://other.example.com\"}"));
+        assertNull(authenticatorReturning(tr, ISSUER).processCallback(getMockRequest(), "the-code"));
+        // The same token is accepted while nothing is configured.
+        assertNotNull(authenticatorReturning(tr, "").processCallback(getMockRequest(), "the-code"));
+    }
+
+    @Test
+    public void test_processCallback_tokenValuesCannotStartALogLine() {
+        // The token is data from outside: an iss, aud or azp with a line break must not start a line of its own.
+        final String forged = "\\n" + FORGED_LINE;
+        final String[][] claimSetAndLoggedValue = {
+                { "{\"email\":\"user@example.com\",\"iss\":\"https://evil.example.com" + forged + "\"}",
+                        "iss=https://evil.example.com?" + FORGED_LINE },
+                { "{\"email\":\"user@example.com\",\"iss\":\"" + ISSUER + "\",\"aud\":\"evil" + forged + "\"}", "aud=evil?" + FORGED_LINE },
+                { "{\"email\":\"user@example.com\",\"iss\":\"" + ISSUER + "\",\"azp\":\"evil" + forged + "\"}",
+                        "azp=evil?" + FORGED_LINE } };
+        for (final String[] pair : claimSetAndLoggedValue) {
+            final LoginCredential[] result = new LoginCredential[1];
+            final List<String> messages = loggedByCallback(authenticatorReturning(tokenResponseWith(jwtOf(pair[0])), ISSUER), result);
+            assertNull(result[0]);
+            assertSingleLine(messages);
+            assertTrue(String.join("\n", messages).contains(pair[1]), "the value was not logged: " + messages);
+        }
     }
 }

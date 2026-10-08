@@ -51,9 +51,10 @@
 			     project therefore lists nothing, and a shade execution would have no artifact to
 			     bundle. Splitting this authenticator out does not make the distribution smaller; it
 			     only moves the code.
-			     If a third-party dependency is ever added here (the JWT signature validation the
-			     authenticator still has a TODO for would need one), add maven-shade-plugin back with
-			     an artifactSet exclude list; fess-sso-entraid's pom has the shape. An unshaded
+			     If a third-party dependency is ever added here, add maven-shade-plugin back with
+			     an artifactSet exclude list; fess-sso-entraid's pom has the shape. (The ID token's
+			     signature is deliberately not verified, so that is not a reason to add one: see the
+			     comment in OpenIdConnectAuthenticator#processCallback.) An unshaded
 			     compile-scope dependency is not on any class path Fess builds: only WEB-INF/lib and
 			     the plugin jars themselves are, so it would fail at run time with
 			     NoClassDefFoundError. -->

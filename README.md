@@ -54,17 +54,19 @@ Then configure the client registered with the OpenID provider:
 | `oic.token.server.url` | the token endpoint (default `https://accounts.google.com/o/oauth2/token`) |
 | `oic.client.id` | the client ID |
 | `oic.client.secret` | the client secret |
+| `oic.issuer` | the issuer identifier the ID token's `iss` claim has to equal; optional, see below. `system.properties` only: the administration screen has no field for it |
 | `oic.scope` | the requested scopes, space-separated; the provider needs `openid` and Fess needs `email` |
 | `oic.redirect.url` | the redirect URI; `{oic.base.url}/sso/` is used when the key is absent |
 | `oic.base.url` | the Fess base URL the redirect URI is built from (default `http://localhost:8080`) |
 | `oic.default.groups` | groups applied to every user whose ID token carries no `groups` claim, comma-separated |
 | `oic.default.roles` | roles applied to every user, comma-separated |
 
-Both endpoint URLs can be read from the provider's `/.well-known/openid-configuration`.
+Both endpoint URLs, and the value for `oic.issuer` (the document's `issuer`, copied exactly), can be
+read from the provider's `/.well-known/openid-configuration`.
 
 A `-Dfess.system.<key>=...` on the JVM command line reaches `oic.default.groups` and
 `oic.default.roles` only, and there only for a key `system.properties` does not hold. The other
-seven are read straight from the `systemProperties` component, which never consults JVM system
+eight are read straight from the `systemProperties` component, which never consults JVM system
 properties: for those, the file or the administration screen is the only channel.
 
 Five things are worth knowing before the first login:
@@ -83,10 +85,23 @@ Five things are worth knowing before the first login:
   applies only when the key is missing. Saving the General page writes the field even when it is
   blank, and the authorization request then carries a valueless `redirect_uri` parameter. Either
   fill the field in or remove the key from `system.properties`.
-* **The ID token's signature is not verified.** The claim set is Base64-decoded and parsed, but
-  neither the signature nor the `iss`, `aud` and `exp` claims are checked. The token is read from
-  the token endpoint over the back channel and never from the browser, so keep that endpoint on
-  HTTPS and treat the path to the provider as part of the trust boundary.
+* **The ID token's signature is deliberately not verified; TLS to the token endpoint is the trust
+  anchor.** The token is read from the token endpoint over the back channel and never from the
+  browser, and [OpenID Connect Core 3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation)
+  (item 6) lets the TLS server validation of that exchange stand in for the signature. For that
+  reason `oic.token.server.url` has to be `https`; `http` is accepted only for `localhost`,
+  `127.x.x.x` and `::1`, compared as written with no name lookup, and any other value makes every
+  login fail with a warning in the log. The claims are checked as follows:
+  * `aud` has to be the string `oic.client.id` or an array that contains it, and `azp`, when the
+    token carries one, has to equal it (a token with several audiences must carry it). A blank
+    `oic.client.id` refuses every token.
+  * `exp` is required and has to be a number. A token is accepted while the current time is less
+    than `exp` plus 300 seconds of clock skew; the warning for an expired token names `exp`, the
+    current time and the skew, so a host with a wrong clock can be recognised.
+  * `iss` is compared with `oic.issuer`, exactly (no normalisation of a trailing slash or the
+    scheme), only when that key is set. When it is not, the check is skipped and one warning per
+    start says so. Setting it is recommended.
+  * `nonce` and PKCE are not implemented, and `iat` and `nbf` are not checked.
 * **There is no single logout and no metadata endpoint.** This authenticator implements neither, so
   `/sso/logout` and `/sso/metadata` answer 400 and logging out ends the Fess session only.
 
