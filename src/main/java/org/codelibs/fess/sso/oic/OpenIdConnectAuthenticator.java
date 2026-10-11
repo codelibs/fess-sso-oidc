@@ -303,7 +303,8 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                 // The user id is the email claim. Without it the credential resolves to a user with a
                 // null name, which the login itself accepts and every later request then fails on, so
                 // the session has to be refused here rather than created and left unusable.
-                logger.warn("The ID token has no email claim, which is the user id. Check that {} requests it.", OIC_SCOPE);
+                logger.warn("The ID token has no email claim that is a string, which is the user id. Check that {} requests it.",
+                        OIC_SCOPE);
                 return null;
             }
             return credential;
@@ -398,9 +399,11 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      * @param jwtClaim the JWT claim string
      * @param attributes the attributes map to populate
      * @throws IOException if an I/O error occurs
+     * @throws IllegalArgumentException if the claim string is not a complete JSON object
      */
     protected void parseJwtClaim(final String jwtClaim, final Map<String, Object> attributes) throws IOException {
         try (final JsonParser jsonParser = jsonFactory.createJsonParser(jwtClaim)) {
+            jsonParser.nextToken();
             attributes.putAll(parseObject(jsonParser));
         }
     }
@@ -416,7 +419,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
         final JsonToken token = jsonParser.getCurrentToken();
         return switch (token) {
         case VALUE_STRING -> jsonParser.getText();
-        case VALUE_NUMBER_INT -> jsonParser.getLongValue();
+        case VALUE_NUMBER_INT -> parseInteger(jsonParser);
         case VALUE_NUMBER_FLOAT -> jsonParser.getDoubleValue();
         case VALUE_TRUE -> true;
         case VALUE_FALSE -> false;
@@ -426,15 +429,54 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     }
 
     /**
-     * Parses array values from JSON parser.
+     * Reads a number the JSON parser reports as an integer. The parser decides that by the absence of a
+     * decimal point alone, so a value such as {@code 4e9}, or an integer beyond the range of a long, arrives
+     * here too and is read as a double.
      *
-     * @param jsonParser the JSON parser
-     * @return the parsed array as a list
+     * @param jsonParser the JSON parser, positioned on the number
+     * @return a {@link Long}, or a {@link Double} when the text is not a long
      * @throws IOException if an I/O error occurs
      */
+    private Object parseInteger(final JsonParser jsonParser) throws IOException {
+        try {
+            return jsonParser.getLongValue();
+        } catch (final NumberFormatException e) {
+            return jsonParser.getDoubleValue();
+        }
+    }
+
+    /**
+     * Moves the JSON parser to the next token, which the document has to still hold. At the end of the
+     * input the parser answers {@code null} again and again, so a loop that waits for a closing token would
+     * never leave.
+     *
+     * @param jsonParser the JSON parser
+     * @return the next token, never null
+     * @throws IOException if an I/O error occurs
+     * @throws IllegalArgumentException if the document ends here
+     */
+    private JsonToken requireNextToken(final JsonParser jsonParser) throws IOException {
+        final JsonToken token = jsonParser.nextToken();
+        if (token == null) {
+            throw new IllegalArgumentException("The JSON document ends before it is complete.");
+        }
+        return token;
+    }
+
+    /**
+     * Parses array values from JSON parser.
+     *
+     * @param jsonParser the JSON parser, positioned on the start of the array
+     * @return the parsed array as a list
+     * @throws IOException if an I/O error occurs
+     * @throws IllegalArgumentException if the parser is not on the start of an array, or the document ends inside it
+     */
     protected Object parseArray(final JsonParser jsonParser) throws IOException {
+        if (jsonParser.getCurrentToken() != JsonToken.START_ARRAY) {
+            throw new IllegalArgumentException("The JSON value is not an array.");
+        }
         final List<Object> list = new ArrayList<>();
-        while (jsonParser.nextToken() != JsonToken.END_ARRAY) {
+        while (requireNextToken(jsonParser) != JsonToken.END_ARRAY) {
             if (jsonParser.getCurrentToken() == JsonToken.START_OBJECT) {
                 list.add(parseObject(jsonParser));
             } else if (jsonParser.getCurrentToken() == JsonToken.START_ARRAY) {
@@ -450,24 +492,30 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     /**
      * Parses object values from JSON parser.
      *
-     * @param jsonParser the JSON parser
+     * @param jsonParser the JSON parser, positioned on the start of the object
      * @return the parsed object as a map
      * @throws IOException if an I/O error occurs
+     * @throws IllegalArgumentException if the parser is not on the start of an object, or the document ends inside it
      */
     protected Map<String, Object> parseObject(final JsonParser jsonParser) throws IOException {
+        if (jsonParser.getCurrentToken() != JsonToken.START_OBJECT) {
+            throw new IllegalArgumentException("The JSON value is not an object.");
+        }
         final Map<String, Object> nestedMap = new HashMap<>();
-        while (jsonParser.nextToken() != JsonToken.END_OBJECT) {
+        JsonToken token;
+        while ((token = requireNextToken(jsonParser)) != JsonToken.END_OBJECT) {
+            if (token != JsonToken.FIELD_NAME) {
+                throw new IllegalArgumentException("The JSON object has a " + token + " where a field name is expected.");
+            }
             final String fieldName = jsonParser.getCurrentName();
-            if (fieldName != null) {
-                jsonParser.nextToken(); // Move to the value of the current field
+            requireNextToken(jsonParser); // Move to the value of the current field
 
-                if (jsonParser.getCurrentToken() == JsonToken.START_ARRAY) {
-                    nestedMap.put(fieldName, parseArray(jsonParser));
-                } else if (jsonParser.getCurrentToken() == JsonToken.START_OBJECT) {
-                    nestedMap.put(fieldName, parseObject(jsonParser));
-                } else {
-                    nestedMap.put(fieldName, parsePrimitive(jsonParser));
-                }
+            if (jsonParser.getCurrentToken() == JsonToken.START_ARRAY) {
+                nestedMap.put(fieldName, parseArray(jsonParser));
+            } else if (jsonParser.getCurrentToken() == JsonToken.START_OBJECT) {
+                nestedMap.put(fieldName, parseObject(jsonParser));
+            } else {
+                nestedMap.put(fieldName, parsePrimitive(jsonParser));
             }
         }
         return nestedMap;
@@ -497,16 +545,22 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      * because it comes straight from this endpoint (see {@link #processCallback}), and the client
      * secret is sent to it, so a plain http endpoint would leave both unprotected. {@code http} is
      * accepted only when the host is the literal {@code localhost}, an address in 127.0.0.0/8 or
-     * {@code ::1}, for a provider on the same machine; nothing is resolved to decide that.
+     * {@code ::1}, for a provider on the same machine; nothing is resolved to decide that. A
+     * {@code #fragment} is refused as well: the token request cannot be built with one, and the
+     * library says so with an exception that has no message.
      *
      * @param url the token endpoint URL (may be null)
-     * @throws IllegalArgumentException if the URL is not https, or http for another host; the
-     *         message does not repeat the URL, which may carry credentials
+     * @throws IllegalArgumentException if the URL is not https, or http for another host, or if it
+     *         carries a fragment; the message does not repeat the URL, which may carry credentials
      */
     protected void requireSecureTokenEndpoint(final String url) {
         if (!isSecureTokenEndpoint(url)) {
             throw new IllegalArgumentException(
                     OIC_TOKEN_SERVER_URL + " must be https (http is accepted only for localhost, 127.x.x.x and ::1)");
+        }
+        // The URL parsed as a URI above, where a '#' can only begin the fragment.
+        if (url.indexOf('#') >= 0) {
+            throw new IllegalArgumentException(OIC_TOKEN_SERVER_URL + " must not contain a #fragment");
         }
     }
 

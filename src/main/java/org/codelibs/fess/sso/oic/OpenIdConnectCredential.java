@@ -53,7 +53,9 @@ public class OpenIdConnectCredential implements LoginCredential, FessCredential 
 
     @Override
     public String getUserId() {
-        return DocumentUtil.getValue(attributes, "email", String.class);
+        // Not DocumentUtil.getValue: it turns a list into its first element and a number into its text, so a
+        // claim that is not an address would become the user name.
+        return attributes.get("email") instanceof final String email ? email : null;
     }
 
     /**

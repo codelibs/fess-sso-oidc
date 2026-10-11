@@ -21,6 +21,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -45,6 +46,7 @@ import org.junit.jupiter.api.TestInfo;
 import org.lastaflute.web.login.credential.LoginCredential;
 
 import com.google.api.client.auth.oauth2.TokenResponse;
+import com.google.api.client.json.JsonParser;
 import com.sun.net.httpserver.HttpServer;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -1233,6 +1235,178 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
             assertNull(result[0]);
             assertSingleLine(messages);
             assertTrue(String.join("\n", messages).contains(pair[1]), "the value was not logged: " + messages);
+        }
+    }
+
+    // ===================================================================================
+    //                                                       Claims that are not an object
+    //                                                       =============================
+
+    /** How long a parse may take before the test calls it a hang; the unfixed loop never ends. */
+    private static final Duration PARSE_TIMEOUT = Duration.ofSeconds(5);
+
+    /** Documents a provider can send in place of a claim set: valid JSON that is not an object, and empty input. */
+    private static final String[] NON_OBJECT_CLAIMS =
+            { "[1]", "[]", "[{\"email\":\"user@example.com\"}]", "null", "5", "\"x\"", "true", "4.5" };
+
+    /** Claim sets that stop in the middle of a token, a name, a value or a nesting level. */
+    private static final String[] TRUNCATED_CLAIMS = { "{", "{\"email\"", "{\"email\":", "{\"email\":\"user@exam", "{\"a\":[", "{\"a\":[1,",
+            "{\"a\":[1", "{\"a\":{", "{\"a\":{\"b\":1", "{\"a\":{\"b\":1}", "" };
+
+    private Throwable parseOutcome(final String claims) {
+        return Assertions.assertTimeoutPreemptively(PARSE_TIMEOUT, () -> {
+            try {
+                authenticator.parseJwtClaim(claims, new HashMap<>());
+                return null;
+            } catch (final Throwable t) {
+                return t;
+            }
+        }, "parsing never returned: " + claims);
+    }
+
+    @Test
+    public void test_parseJwtClaim_refusesClaimsThatAreNotAnObject() {
+        for (final String claims : NON_OBJECT_CLAIMS) {
+            final Throwable t = parseOutcome(claims);
+            assertTrue(t instanceof IllegalArgumentException, claims + " -> " + t);
+        }
+    }
+
+    @Test
+    public void test_parseJwtClaim_truncatedClaimsFailAsAnIoOrIllegalArgumentException() {
+        // Anything else (the NullPointerException that used to come out of parsePrimitive) is not caught by the
+        // callback and leaves the browser on a system error page.
+        for (final String claims : TRUNCATED_CLAIMS) {
+            final Throwable t = parseOutcome(claims);
+            assertTrue(t instanceof IOException || t instanceof IllegalArgumentException, claims + " -> " + t);
+        }
+    }
+
+    @Test
+    public void test_parseObject_requiresTheParserToStandOnAnObject() throws IOException {
+        for (final String json : new String[] { "5", "[1]", "\"x\"" }) {
+            try (final JsonParser parser = authenticator.jsonFactory.createJsonParser(json)) {
+                parser.nextToken();
+                Assertions.assertTimeoutPreemptively(PARSE_TIMEOUT,
+                        () -> Assertions.assertThrows(IllegalArgumentException.class, () -> authenticator.parseObject(parser), json));
+            }
+        }
+    }
+
+    @Test
+    public void test_parseArray_requiresTheParserToStandOnAnArray() throws IOException {
+        for (final String json : new String[] { "5", "{\"a\":1}", "\"x\"" }) {
+            try (final JsonParser parser = authenticator.jsonFactory.createJsonParser(json)) {
+                parser.nextToken();
+                Assertions.assertTimeoutPreemptively(PARSE_TIMEOUT,
+                        () -> Assertions.assertThrows(IllegalArgumentException.class, () -> authenticator.parseArray(parser), json));
+            }
+        }
+    }
+
+    @Test
+    public void test_processCallback_withMalformedClaimsIsOneWarningAndNoCredential() {
+        final List<String> claimSets = new ArrayList<>(List.of(NON_OBJECT_CLAIMS));
+        claimSets.addAll(List.of(TRUNCATED_CLAIMS));
+        for (final String claims : claimSets) {
+            final LoginCredential[] result = new LoginCredential[1];
+            final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
+            try {
+                Assertions.assertTimeoutPreemptively(PARSE_TIMEOUT, () -> {
+                    result[0] = authenticatorReturning(tokenResponseWith(bareJwtOf(claims))).processCallback(getMockRequest(), "the-code");
+                }, "the callback never returned: " + claims);
+            } finally {
+                appender.detach();
+            }
+            assertNull(result[0], claims);
+            final List<LogEvent> warnings = appender.eventsAt(Level.WARN);
+            assertEquals(1, warnings.size(), claims + " -> " + appender.renderedEvents());
+            assertNull(warnings.get(0).getThrown(), "a stack trace on an anonymous endpoint: " + claims);
+            assertTrue(warnings.get(0).getMessage().getFormattedMessage().startsWith("Failed to process the OpenID Connect callback: "),
+                    claims + " -> " + warnings.get(0).getMessage().getFormattedMessage());
+        }
+    }
+
+    @Test
+    public void test_parseJwtClaim_stillParsesNestedObjectsAndArrays() throws IOException {
+        final Map<String, Object> attributes = new HashMap<>();
+        authenticator.parseJwtClaim("{\"a\":{\"b\":[1,{\"c\":[]},[2]]},\"d\":{}}", attributes);
+        assertEquals(Map.of("a", Map.of("b", List.of(1L, Map.of("c", List.of()), List.of(2L))), "d", Map.of()), attributes);
+    }
+
+    // ===================================================================================
+    //                                                            Exponent-form JSON numbers
+    //                                                            ==========================
+
+    @Test
+    public void test_parseJwtClaim_numberWithAnExponentButNoDot() throws IOException {
+        final Map<String, Object> attributes = new HashMap<>();
+        authenticator.parseJwtClaim("{\"a\":4e9,\"b\":-4E9,\"c\":4.0e9,\"d\":4000000000,\"e\":2e0}", attributes);
+        assertEquals(4.0e9, attributes.get("a"));
+        assertEquals(-4.0e9, attributes.get("b"));
+        assertEquals(4.0e9, attributes.get("c"));
+        assertEquals(4000000000L, attributes.get("d"));
+        assertEquals(2.0, attributes.get("e"));
+    }
+
+    @Test
+    public void test_processCallback_acceptsAnExpiryWrittenWithAnExponent() {
+        final LoginCredential credential = callbackWith(jwtOf("{\"email\":\"user@example.com\",\"exp\":4e9}"));
+        assertNotNull(credential);
+        assertEquals("{user@example.com}", credential.toString());
+    }
+
+    // ===================================================================================
+    //                                                      A fragment in the token endpoint
+    //                                                      ================================
+
+    private static final String FRAGMENT_REFUSAL = "oic.token.server.url must not contain a #fragment";
+
+    @Test
+    public void test_requireSecureTokenEndpoint_refusesAFragment() {
+        for (final String url : new String[] { "https://idp.example.com/token#frag", "https://idp.example.com/token#",
+                "http://127.0.0.1:8080/token#frag", "  https://idp.example.com/token#frag  " }) {
+            final IllegalArgumentException e =
+                    Assertions.assertThrows(IllegalArgumentException.class, () -> authenticator.requireSecureTokenEndpoint(url), url);
+            Assertions.assertEquals(FRAGMENT_REFUSAL, e.getMessage(), url);
+        }
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_httpsRuleComesFirst() {
+        final IllegalArgumentException e = Assertions.assertThrows(IllegalArgumentException.class,
+                () -> authenticator.requireSecureTokenEndpoint("http://idp.example.com/token#frag"));
+        assertEquals(ENDPOINT_REFUSAL, e.getMessage());
+    }
+
+    @Test
+    public void test_requireSecureTokenEndpoint_aQueryIsNotAFragment() {
+        assertAccepted("https://idp.example.com/token?a=b", "https://idp.example.com/token?a=b%23c");
+    }
+
+    @Test
+    public void test_processCallback_withAFragmentInTheTokenEndpoint() {
+        final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("https://user:s3cr3t@idp.invalid/token#frag");
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
+        try {
+            assertNull(remote.processCallback(getMockRequest(), "the-code"));
+        } finally {
+            appender.detach();
+        }
+        final List<String> warnings = appender.warnings();
+        assertEquals(List.of("Failed to process the OpenID Connect callback: " + FRAGMENT_REFUSAL), warnings);
+        assertFalse(String.join("\n", warnings).contains("s3cr3t"), "the URL was logged: " + warnings);
+    }
+
+    // ===================================================================================
+    //                                                          An email that is not a string
+    //                                                          =============================
+
+    @Test
+    public void test_processCallback_withAnEmailClaimThatIsNotAString() {
+        for (final String email : new String[] { "[\"a@example.com\"]", "[\"a@example.com\",\"b@example.com\"]", "42", "true",
+                "{\"a\":1}" }) {
+            assertNull(callbackWith(jwtOf("{\"email\":" + email + "}")), email);
         }
     }
 }
