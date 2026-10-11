@@ -43,7 +43,9 @@ import org.lastaflute.web.util.LaRequestUtil;
 import com.google.api.client.auth.oauth2.AuthorizationCodeRequestUrl;
 import com.google.api.client.auth.oauth2.AuthorizationCodeTokenRequest;
 import com.google.api.client.auth.oauth2.TokenResponse;
+import com.google.api.client.auth.oauth2.TokenResponseException;
 import com.google.api.client.http.GenericUrl;
+import com.google.api.client.http.HttpResponseException;
 import com.google.api.client.http.HttpTransport;
 import com.google.api.client.http.javanet.NetHttpTransport;
 import com.google.api.client.json.JsonFactory;
@@ -308,6 +310,12 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                 return null;
             }
             return credential;
+        } catch (final HttpResponseException e) {
+            // The message of this exception is the status line, then the request line (the full token URL,
+            // which may carry credentials in its user info or query) and then the whole response body, which
+            // can echo the code of this anonymous caller. None of it is logged, not even as a stack trace at
+            // debug level: only the status and, for an OAuth error response, its error code.
+            logger.warn("Failed to process the OpenID Connect callback: {}", describeTokenEndpointError(e));
         } catch (final IOException | IllegalArgumentException e) {
             // This endpoint is anonymous, so anyone can drive a failing callback. A message keeps a
             // misbehaving provider diagnosable; the stack trace stays behind the debug level so an
@@ -318,6 +326,25 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             }
         }
         return null;
+    }
+
+    /**
+     * Describes an error answer of the token endpoint for the log: the HTTP status, its reason phrase and,
+     * for an OAuth error response, the {@code error} code. Never the request URL or the response body, which
+     * {@link HttpResponseException#getMessage()} repeats in full.
+     *
+     * @param e the error answer
+     * @return a one-line description
+     */
+    protected static String describeTokenEndpointError(final HttpResponseException e) {
+        final StringBuilder buf = new StringBuilder("the token endpoint answered HTTP ").append(e.getStatusCode());
+        if (StringUtil.isNotBlank(e.getStatusMessage())) {
+            buf.append(' ').append(sanitizeForLog(e.getStatusMessage()));
+        }
+        if (e instanceof final TokenResponseException tre && tre.getDetails() != null && tre.getDetails().getError() != null) {
+            buf.append(", error=").append(sanitizeForLog(tre.getDetails().getError()));
+        }
+        return buf.toString();
     }
 
     /**
@@ -533,7 +560,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
         final String tokenServerUrl = getOicTokenServerUrl();
         requireSecureTokenEndpoint(tokenServerUrl);
         try {
-            return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, new GenericUrl(tokenServerUrl), code)//
+            return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, toGenericUrl(tokenServerUrl), code)//
                     .setGrantType("authorization_code")//
                     .setRedirectUri(getOicRedirectUrl())//
                     .set("client_id", getOicClientId())//
@@ -544,6 +571,16 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             // right after a field name or its colon. Every other truncation is an IOException, so this
             // one is made the same, which processCallback turns into a refused login.
             throw new IOException("The token response is not a complete JSON document.", e);
+        }
+    }
+
+    private static GenericUrl toGenericUrl(final String url) {
+        try {
+            return new GenericUrl(url);
+        } catch (final IllegalArgumentException e) {
+            // Dropped, not chained: the message of the MalformedURLException inside repeats part of the URL,
+            // which may carry credentials.
+            throw new IllegalArgumentException(OIC_TOKEN_SERVER_URL + " is not a valid URL");
         }
     }
 
