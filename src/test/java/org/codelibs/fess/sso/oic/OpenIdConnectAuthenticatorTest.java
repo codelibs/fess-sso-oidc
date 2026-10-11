@@ -1129,6 +1129,69 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         }
     }
 
+    /**
+     * Starts a token endpoint on the loopback address that answers every request with 200 and the given body.
+     */
+    private static HttpServer tokenEndpointAnswering(final String[] body) throws IOException {
+        final HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0);
+        server.createContext("/token", exchange -> {
+            final byte[] bytes = body[0].getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, bytes.length == 0 ? -1 : bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        server.start();
+        return server;
+    }
+
+    @Test
+    public void test_processCallback_withATokenResponseCutAtAnyPosition() throws IOException {
+        // The JSON parser of the HTTP client raises a NullPointerException when the document ends right after a field
+        // name or its colon, which is not an IOException and so used to leave the callback as a system error. Every
+        // other position already ended as an IOException. What the cut leaves behind is the provider's business, so
+        // only the exception type is asserted: a document cut after a complete id_token is still read by the parser.
+        final String full = "{\"access_token\":\"access-token\",\"token_type\":\"Bearer\",\"expires_in\":300,\"id_token\":\""
+                + jwtOf("{\"email\":\"user@example.com\"}") + "\",\"refresh_token\":\"r\"}";
+        final String[] body = new String[1];
+        final HttpServer server = tokenEndpointAnswering(body);
+        try {
+            final OpenIdConnectAuthenticator local =
+                    authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
+            final List<String> escaped = new ArrayList<>();
+            for (int i = 0; i < full.length(); i++) {
+                body[0] = full.substring(0, i);
+                try {
+                    local.processCallback(getMockRequest(), "the-code");
+                } catch (final RuntimeException e) {
+                    escaped.add(i + ": " + e);
+                }
+            }
+            assertTrue(escaped.isEmpty(), "escaped from the callback: " + escaped);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    public void test_processCallback_withATokenResponseCutAfterAFieldName() throws IOException {
+        final String[] body = { "{\"access_token\":" };
+        final HttpServer server = tokenEndpointAnswering(body);
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            final OpenIdConnectAuthenticator local =
+                    authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
+            assertNull(local.processCallback(getMockRequest(), "the-code"));
+        } finally {
+            appender.detach();
+            server.stop(0);
+        }
+        assertEquals(1, appender.eventsAt(Level.WARN).size(), "warnings: " + appender.warnings());
+        assertTrue(appender.warnings().get(0).startsWith("Failed to process the OpenID Connect callback: "), appender.warnings().get(0));
+        assertNull(appender.eventsAt(Level.WARN).get(0).getThrown(), "the refusal must not be logged with a stack trace");
+    }
+
     // ===================================================================================
     //                                                    Claim validation in the callback
     //                                                    ================================

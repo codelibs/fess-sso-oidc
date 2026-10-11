@@ -526,18 +526,25 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      *
      * @param code the authorization code
      * @return the token response
-     * @throws IOException if an I/O error occurs
+     * @throws IOException if an I/O error occurs, or the token response is cut off
      * @throws IllegalArgumentException if the token server URL is not acceptable, see {@link #requireSecureTokenEndpoint(String)}
      */
     protected TokenResponse getTokenUrl(final String code) throws IOException {
         final String tokenServerUrl = getOicTokenServerUrl();
         requireSecureTokenEndpoint(tokenServerUrl);
-        return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, new GenericUrl(tokenServerUrl), code)//
-                .setGrantType("authorization_code")//
-                .setRedirectUri(getOicRedirectUrl())//
-                .set("client_id", getOicClientId())//
-                .set("client_secret", getOicClientSecret())//
-                .execute();
+        try {
+            return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, new GenericUrl(tokenServerUrl), code)//
+                    .setGrantType("authorization_code")//
+                    .setRedirectUri(getOicRedirectUrl())//
+                    .set("client_id", getOicClientId())//
+                    .set("client_secret", getOicClientSecret())//
+                    .execute();
+        } catch (final NullPointerException e) {
+            // The JSON parser of the HTTP client dereferences the missing token when the response ends
+            // right after a field name or its colon. Every other truncation is an IOException, so this
+            // one is made the same, which processCallback turns into a refused login.
+            throw new IOException("The token response is not a complete JSON document.", e);
+        }
     }
 
     /**
