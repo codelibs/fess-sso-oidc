@@ -1192,6 +1192,103 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         assertNull(appender.eventsAt(Level.WARN).get(0).getThrown(), "the refusal must not be logged with a stack trace");
     }
 
+    /**
+     * Starts a token endpoint on the loopback address that answers every request with the given status and body.
+     */
+    private static HttpServer tokenEndpointAnswering(final int status, final String contentType, final String body) throws IOException {
+        final HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0);
+        server.createContext("/token", exchange -> {
+            final byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", contentType);
+            exchange.sendResponseHeaders(status, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        server.start();
+        return server;
+    }
+
+    /**
+     * Runs a callback against a token endpoint that refuses it, with a token URL that carries a password and a
+     * query secret, and a response body that echoes the code. Returns what the class logged, rendered with the
+     * stack traces, at every level.
+     */
+    private List<String> loggedWhenTheTokenEndpointRefuses(final int status, final String contentType, final String body)
+            throws IOException {
+        final HttpServer server = tokenEndpointAnswering(status, contentType, body);
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            final OpenIdConnectAuthenticator local = authenticatorWithTokenEndpoint(
+                    "http://oicuser:URLPASSWORD@127.0.0.1:" + server.getAddress().getPort() + "/token?api_key=QUERYSECRET");
+            assertNull(local.processCallback(getMockRequest(), "CODEMARKER"));
+        } finally {
+            appender.detach();
+            server.stop(0);
+        }
+        assertEquals(1, appender.eventsAt(Level.WARN).size(), "warnings: " + appender.warnings());
+        return appender.renderedEvents();
+    }
+
+    private void assertNothingSecretLogged(final List<String> rendered) {
+        final String all = String.join("\n", rendered);
+        for (final String secret : new String[] { "URLPASSWORD", "QUERYSECRET", "BODYMARKER", "CODEMARKER", "oicuser", "127.0.0.1" }) {
+            assertFalse(all.contains(secret), secret + " reached the log: " + all);
+        }
+    }
+
+    @Test
+    public void test_processCallback_oauthErrorFromTheTokenEndpointLogsOnlyTheStatusAndTheErrorCode() throws IOException {
+        final List<String> rendered = loggedWhenTheTokenEndpointRefuses(400, "application/json",
+                "{\"error\":\"invalid_grant\",\"error_description\":\"BODYMARKER bad code CODEMARKER\\r\\n" + FORGED_LINE + "\"}");
+        assertNothingSecretLogged(rendered);
+        for (final String message : rendered) {
+            assertFalse(message.contains(FORGED_LINE), "the body reached the log: " + message);
+        }
+        final String warning = rendered.stream().filter(m -> m.startsWith("Failed to process")).findFirst().orElseThrow();
+        assertEquals("Failed to process the OpenID Connect callback: the token endpoint answered HTTP 400 Bad Request, error=invalid_grant",
+                warning);
+        assertSingleLine(rendered);
+    }
+
+    @Test
+    public void test_processCallback_nonJsonErrorFromTheTokenEndpointLogsOnlyTheStatus() throws IOException {
+        final List<String> rendered = loggedWhenTheTokenEndpointRefuses(500, "text/plain",
+                "BODYMARKER code=CODEMARKER\r\n\u0085\u2028" + FORGED_LINE + "\n" + "x".repeat(5000));
+        assertNothingSecretLogged(rendered);
+        assertEquals(1, rendered.size(), "the refusal must not be logged with a stack trace or at another level: " + rendered);
+        assertEquals("Failed to process the OpenID Connect callback: the token endpoint answered HTTP 500 Internal Server Error",
+                rendered.get(0));
+    }
+
+    @Test
+    public void test_processCallback_oauthErrorCodeFromTheTokenEndpointCannotStartALogLine() throws IOException {
+        final List<String> rendered =
+                loggedWhenTheTokenEndpointRefuses(400, "application/json", "{\"error\":\"bad\\r\\n\\u0085\\u2028" + FORGED_LINE + "\"}");
+        assertEquals(1, rendered.size(), "rendered: " + rendered);
+        assertSingleLine(rendered);
+        assertTrue(rendered.get(0).contains("error=bad????"), rendered.get(0));
+    }
+
+    @Test
+    public void test_processCallback_aTokenUrlJavaCannotParseDoesNotRepeatItself() {
+        // new GenericUrl(String) reports the parse error of java.net.URL, which quotes a part of the URL.
+        final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("https://oicuser:URLPASSWORD@host:99999999999/token");
+        final IllegalArgumentException e = Assertions.assertThrows(IllegalArgumentException.class, () -> remote.getTokenUrl("the-code"));
+        assertEquals("oic.token.server.url is not a valid URL", e.getMessage());
+        assertNull(e.getCause());
+        final OpenIdConnectAuthenticator quoted = authenticatorWithTokenEndpoint("https://oicuser:URLPASSWORD:x/token");
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            assertNull(quoted.processCallback(getMockRequest(), "the-code"));
+        } finally {
+            appender.detach();
+        }
+        final String all = String.join("\n", appender.renderedEvents());
+        assertTrue(all.contains("is not a valid URL"), all);
+        assertFalse(all.contains("URLPASSWORD"), "the URL was logged: " + all);
+    }
+
     // ===================================================================================
     //                                                    Claim validation in the callback
     //                                                    ================================
