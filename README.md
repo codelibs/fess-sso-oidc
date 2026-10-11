@@ -71,10 +71,10 @@ properties: for those, the file or the administration screen is the only channel
 
 Five things are worth knowing before the first login:
 
-* **The user id is the `email` claim.** An ID token without one is refused with a warning naming
-  `oic.scope`, and no session is created — so `email` has to be among the scopes the provider
-  grants, and the account has to have an address. The user id is also what a document ACL has to
-  name for role-based search to match.
+* **The user id is the `email` claim.** An ID token without one, or whose `email` is not a string,
+  is refused with a warning naming `oic.scope`, and no session is created — so `email` has to be
+  among the scopes the provider grants, and the account has to have an address. The user id is
+  also what a document ACL has to name for role-based search to match.
 * **Groups come from the `groups` claim, verbatim.** There is no directory lookup and no expansion
   of nested groups, so which groups arrive is entirely up to the provider's claim configuration; a
   provider that emits full paths sends `/parent/child`, which does not match a document tagged with
@@ -91,7 +91,8 @@ Five things are worth knowing before the first login:
   (item 6) lets the TLS server validation of that exchange stand in for the signature. For that
   reason `oic.token.server.url` has to be `https`; `http` is accepted only for `localhost`,
   `127.x.x.x` and `::1`, compared as written with no name lookup, and any other value makes every
-  login fail with a warning in the log. The claims are checked as follows:
+  login fail with a warning in the log. So does a `#fragment` in the URL, which the token request
+  cannot carry. The claims are checked as follows:
   * `aud` has to be the string `oic.client.id` or an array that contains it, and `azp`, when the
     token carries one, has to equal it (a token with several audiences must carry it). A blank
     `oic.client.id` refuses every token.

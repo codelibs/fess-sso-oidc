@@ -100,4 +100,18 @@ public class OpenIdConnectCredentialTest extends UnitFessTestCase {
     public void test_getUserId_withoutEmailClaim() {
         assertNull(new OpenIdConnectCredential(new HashMap<>()).getUserId());
     }
+
+    @Test
+    public void test_getUserId_isTheEmailClaimWhenItIsAString() {
+        assertEquals("user@example.com", new OpenIdConnectCredential(Map.of("email", "user@example.com")).getUserId());
+    }
+
+    @Test
+    public void test_getUserId_isNullForAnEmailClaimThatIsNotAString() {
+        // DocumentUtil converts a list to its first element and a number to its text, which turned a claim that was
+        // never an address into the user name.
+        assertNull(new OpenIdConnectCredential(Map.of("email", List.of("a@example.com"))).getUserId());
+        assertNull(new OpenIdConnectCredential(Map.of("email", 42L)).getUserId());
+        assertNull(new OpenIdConnectCredential(Map.of("email", true)).getUserId());
+    }
 }
