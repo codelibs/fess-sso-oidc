@@ -4,7 +4,7 @@
 	<artifactId>fess-sso-oidc</artifactId>
 	<packaging>jar</packaging>
 	<name>OpenID Connect SSO Plugin</name>
-	<version>15.9.1-SNAPSHOT</version>
+	<version>15.10.0-SNAPSHOT</version>
 	<description>OpenID Connect single sign-on for Fess: the authenticator behind sso.type=oic.</description>
 	<scm>
 		<connection>scm:git:git@github.com:codelibs/fess-sso-oidc.git</connection>
@@ -15,7 +15,7 @@
 	<parent>
 		<groupId>org.codelibs.fess</groupId>
 		<artifactId>fess-parent</artifactId>
-		<version>15.9.0</version>
+		<version>15.10.0-SNAPSHOT</version>
 		<relativePath />
 	</parent>
 	<build>
