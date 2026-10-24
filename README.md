@@ -82,9 +82,10 @@ Five things are worth knowing before the first login:
   but empty does not, and leaves the user with no groups. Roles are always `oic.default.roles`:
   no claim is read for them.
 * **An empty `oic.redirect.url` is not an absent one.** The fallback to `{oic.base.url}/sso/`
-  applies only when the key is missing. Saving the General page writes the field even when it is
-  blank, and the authorization request then carries a valueless `redirect_uri` parameter. Either
-  fill the field in or remove the key from `system.properties`.
+  applies only when the key is missing. A `oic.redirect.url=` line in `system.properties` makes the
+  authorization request carry a valueless `redirect_uri` parameter, so either give it a value or
+  remove the line. A blank field on the General page is safe: saving it removes the key, and the
+  fallback applies.
 * **The ID token's signature is deliberately not verified; TLS to the token endpoint is the trust
   anchor.** The token is read from the token endpoint over the back channel and never from the
   browser, and [OpenID Connect Core 3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation)
