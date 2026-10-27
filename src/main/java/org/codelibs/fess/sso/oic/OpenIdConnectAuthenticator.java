@@ -98,6 +98,9 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     /** Session key for OpenID Connect state parameter. */
     protected static final String OIC_STATE = "OIC_STATE";
 
+    /** Session key for OpenID Connect nonce parameter. */
+    protected static final String OIC_NONCE = "OIC_NONCE";
+
     /** Configuration key for OpenID Connect base URL. */
     protected static final String OIC_BASE_URL = "oic.base.url";
 
@@ -145,6 +148,10 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             final HttpSession session = request.getSession(false);
             if (session != null) {
                 final String sesState = (String) session.getAttribute(OIC_STATE);
+                // Taken out together with the state: both belong to the one authorization request this
+                // callback answers, and neither may serve a second callback.
+                final String sesNonce = (String) session.getAttribute(OIC_NONCE);
+                session.removeAttribute(OIC_NONCE);
                 if (StringUtil.isNotBlank(sesState)) {
                     session.removeAttribute(OIC_STATE);
                     final String code = request.getParameter("code");
@@ -167,7 +174,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                             return null;
                         }
                         if (StringUtil.isNotBlank(code)) {
-                            return processCallback(request, code);
+                            return processCallback(request, code, sesNonce);
                         }
                     }
                 }
@@ -208,12 +215,19 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
         // the JVM and under 32 bits actually vary per call. The value is only ever compared with
         // equals() against the copy held in the session, so its length and format are free.
         final String state = UUID.randomUUID().toString();
-        request.getSession().setAttribute(OIC_STATE, state);
+        // The nonce binds the ID token to this session (OpenID Connect Core 3.1.2.1, 3.1.3.7 item 11): it
+        // is sent in the authentication request and has to come back in the id_token. Same source as the
+        // state, for the same reason.
+        final String nonce = UUID.randomUUID().toString();
+        final HttpSession session = request.getSession();
+        session.setAttribute(OIC_STATE, state);
+        session.setAttribute(OIC_NONCE, nonce);
         return new AuthorizationCodeRequestUrl(getOicAuthServerUrl(), getOicClientId())//
                 .setScopes(Arrays.asList(getOicScope()))//
                 .setResponseTypes(Arrays.asList("code"))//
                 .setRedirectUri(getOicRedirectUrl())//
                 .setState(state)//
+                .set("nonce", nonce)//
                 .build();
     }
 
@@ -242,9 +256,10 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      *
      * @param request the HTTP servlet request
      * @param code the authorization code
+     * @param expectedNonce the nonce sent in this login's authentication request (may be null)
      * @return the login credential
      */
-    protected LoginCredential processCallback(final HttpServletRequest request, final String code) {
+    protected LoginCredential processCallback(final HttpServletRequest request, final String code, final String expectedNonce) {
         try {
             final TokenResponse tr = getTokenUrl(code);
 
@@ -278,7 +293,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             // request, and OpenID Connect Core 3.1.3.7 (item 6) lets the TLS server validation of that
             // exchange stand in for the signature check. That is why getTokenUrl insists on https.
             // What the specification still requires of the claims -- aud, azp, exp and, when oic.issuer
-            // is set, iss -- is checked in validateIdTokenClaims below.
+            // is set, iss -- is checked in validateIdTokenClaims below, and the nonce in validateNonce.
 
             final Map<String, Object> attributes = new HashMap<>();
             attributes.put("accesstoken", tr.getAccessToken());
@@ -299,6 +314,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             }
             parseJwtClaim(jwtClaim, attributes);
             validateIdTokenClaims(attributes, System.currentTimeMillis() / 1000);
+            validateNonce(attributes, expectedNonce);
 
             final OpenIdConnectCredential credential = new OpenIdConnectCredential(attributes);
             if (StringUtil.isBlank(credential.getUserId())) {
@@ -417,6 +433,29 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
         if (!(nowSeconds < exp.doubleValue() + CLOCK_SKEW_SECONDS)) {
             throw new IllegalArgumentException(
                     "The ID token has expired: exp=" + exp + ", now=" + nowSeconds + ", allowed clock skew=" + CLOCK_SKEW_SECONDS + "s.");
+        }
+    }
+
+    /**
+     * Checks that the ID token answers the authentication request this session sent: its {@code nonce} claim
+     * has to equal the nonce that request carried (OpenID Connect Core 3.1.3.7 item 11). A token without the
+     * claim is refused too, because a client that sent a nonce is entitled to find it in the token.
+     *
+     * @param claims the claim set of the ID token
+     * @param expectedNonce the nonce kept in the session for this login, null or blank if there was none
+     * @throws IllegalArgumentException if the nonce is missing from the session or the token, or differs
+     */
+    protected void validateNonce(final Map<String, Object> claims, final String expectedNonce) {
+        if (StringUtil.isBlank(expectedNonce)) {
+            throw new IllegalArgumentException("No nonce was issued for this login, so the ID token cannot be matched to it.");
+        }
+        // Neither value is logged: the token's claim is the provider's input and the expected one is this
+        // session's secret.
+        if (!(claims.get("nonce") instanceof final String nonce)) {
+            throw new IllegalArgumentException("The ID token has no nonce claim that is a string.");
+        }
+        if (!expectedNonce.equals(nonce)) {
+            throw new IllegalArgumentException("The nonce of the ID token is not the one sent in the authentication request.");
         }
     }
 

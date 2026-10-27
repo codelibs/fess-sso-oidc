@@ -103,7 +103,13 @@ Five things are worth knowing before the first login:
   * `iss` is compared with `oic.issuer`, exactly (no normalisation of a trailing slash or the
     scheme), only when that key is set. When it is not, the check is skipped and one warning per
     start says so. Setting it is recommended.
-  * `nonce` and PKCE are not implemented, and `iat` and `nbf` are not checked.
+  * `nonce`: every authorization request carries a fresh random `nonce`, kept in the session next
+    to the `state` and discarded when the callback arrives. The ID token has to contain a string
+    `nonce` claim equal to it; a token without the claim, or with another value, is refused with a
+    warning that does not repeat either value. A provider that omits the claim therefore cannot be
+    used (OpenID Connect Core requires it to echo the nonce), and there is no setting to relax this.
+    A login that was started before the plugin was updated fails once and has to be retried.
+  * PKCE is not implemented, and `iat` and `nbf` are not checked.
 * **There is no single logout and no metadata endpoint.** This authenticator implements neither, so
   `/sso/logout` and `/sso/metadata` answer 400 and logging out ends the Fess session only.
 

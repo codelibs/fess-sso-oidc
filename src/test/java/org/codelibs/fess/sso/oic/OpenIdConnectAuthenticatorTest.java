@@ -361,6 +361,9 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     /** 2100-01-01 in seconds since the epoch: a token that is not expired by the time anyone runs this. */
     private static final long FAR_FUTURE_EXP = 4102444800L;
 
+    /** The nonce the authenticators below are told this login's authentication request carried. */
+    private static final String NONCE = "the-nonce";
+
     /** Builds a JWT without adding anything to the claim set: for tests of what a token that lacks a claim does. */
     private static String bareJwtOf(final String claimJson) {
         return segment("{\"alg\":\"RS256\"}") + "." + segment(claimJson) + "." + segment("signature");
@@ -374,7 +377,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
      */
     private static String jwtOf(final String claimJson) {
         final String rest = claimJson.trim().substring(1).trim();
-        final String defaults = "{\"aud\":\"" + CLIENT_ID + "\",\"exp\":" + FAR_FUTURE_EXP;
+        final String defaults = "{\"aud\":\"" + CLIENT_ID + "\",\"exp\":" + FAR_FUTURE_EXP + ",\"nonce\":\"" + NONCE + "\"";
         return bareJwtOf(defaults + ("}".equals(rest) ? "}" : "," + rest));
     }
 
@@ -413,7 +416,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     }
 
     private LoginCredential callbackWith(final Object idToken) {
-        return authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code");
+        return authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code", NONCE);
     }
 
     @Test
@@ -608,7 +611,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     private String debugOutputOfCallback(final TokenResponse tr) {
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            authenticatorReturning(tr).processCallback(getMockRequest(), "the-code");
+            authenticatorReturning(tr).processCallback(getMockRequest(), "the-code", NONCE);
         } finally {
             appender.detach();
         }
@@ -1094,7 +1097,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("http://user:s3cr3t@idp.invalid/token");
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            assertNull(remote.processCallback(getMockRequest(), "the-code"));
+            assertNull(remote.processCallback(getMockRequest(), "the-code", NONCE));
         } finally {
             appender.detach();
         }
@@ -1121,7 +1124,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         try {
             final OpenIdConnectAuthenticator local =
                     authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
-            final LoginCredential credential = local.processCallback(getMockRequest(), "the-code");
+            final LoginCredential credential = local.processCallback(getMockRequest(), "the-code", NONCE);
             assertNotNull(credential);
             assertEquals("{user@example.com}", credential.toString());
         } finally {
@@ -1163,7 +1166,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
             for (int i = 0; i < full.length(); i++) {
                 body[0] = full.substring(0, i);
                 try {
-                    local.processCallback(getMockRequest(), "the-code");
+                    local.processCallback(getMockRequest(), "the-code", NONCE);
                 } catch (final RuntimeException e) {
                     escaped.add(i + ": " + e);
                 }
@@ -1182,7 +1185,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         try {
             final OpenIdConnectAuthenticator local =
                     authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
-            assertNull(local.processCallback(getMockRequest(), "the-code"));
+            assertNull(local.processCallback(getMockRequest(), "the-code", NONCE));
         } finally {
             appender.detach();
             server.stop(0);
@@ -1221,7 +1224,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         try {
             final OpenIdConnectAuthenticator local = authenticatorWithTokenEndpoint(
                     "http://oicuser:URLPASSWORD@127.0.0.1:" + server.getAddress().getPort() + "/token?api_key=QUERYSECRET");
-            assertNull(local.processCallback(getMockRequest(), "CODEMARKER"));
+            assertNull(local.processCallback(getMockRequest(), "CODEMARKER", NONCE));
         } finally {
             appender.detach();
             server.stop(0);
@@ -1280,7 +1283,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final OpenIdConnectAuthenticator quoted = authenticatorWithTokenEndpoint("https://oicuser:URLPASSWORD:x/token");
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            assertNull(quoted.processCallback(getMockRequest(), "the-code"));
+            assertNull(quoted.processCallback(getMockRequest(), "the-code", NONCE));
         } finally {
             appender.detach();
         }
@@ -1296,7 +1299,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     private List<String> loggedByCallback(final OpenIdConnectAuthenticator authenticator, final LoginCredential[] result) {
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            result[0] = authenticator.processCallback(getMockRequest(), "the-code");
+            result[0] = authenticator.processCallback(getMockRequest(), "the-code", NONCE);
         } finally {
             appender.detach();
         }
@@ -1341,12 +1344,12 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
 
     @Test
     public void test_processCallback_withoutExpiry() {
-        assertNull(callbackWith(bareJwtOf("{\"aud\":\"" + CLIENT_ID + "\",\"email\":\"user@example.com\"}")));
+        assertNull(callbackWith(bareJwtOf("{\"aud\":\"" + CLIENT_ID + "\",\"nonce\":\"" + NONCE + "\",\"email\":\"user@example.com\"}")));
     }
 
     @Test
     public void test_processCallback_withoutAudience() {
-        assertNull(callbackWith(bareJwtOf("{\"exp\":" + FAR_FUTURE_EXP + ",\"email\":\"user@example.com\"}")));
+        assertNull(callbackWith(bareJwtOf("{\"exp\":" + FAR_FUTURE_EXP + ",\"nonce\":\"" + NONCE + "\",\"email\":\"user@example.com\"}")));
     }
 
     @Test
@@ -1368,15 +1371,15 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
                 return tr;
             }
         };
-        assertNull(unconfigured.processCallback(getMockRequest(), "the-code"));
+        assertNull(unconfigured.processCallback(getMockRequest(), "the-code", NONCE));
     }
 
     @Test
     public void test_processCallback_withTheIssuerOfAnotherProvider() {
         final TokenResponse tr = tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"iss\":\"https://other.example.com\"}"));
-        assertNull(authenticatorReturning(tr, ISSUER).processCallback(getMockRequest(), "the-code"));
+        assertNull(authenticatorReturning(tr, ISSUER).processCallback(getMockRequest(), "the-code", NONCE));
         // The same token is accepted while nothing is configured.
-        assertNotNull(authenticatorReturning(tr, "").processCallback(getMockRequest(), "the-code"));
+        assertNotNull(authenticatorReturning(tr, "").processCallback(getMockRequest(), "the-code", NONCE));
     }
 
     @Test
@@ -1473,7 +1476,8 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
             final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
             try {
                 Assertions.assertTimeoutPreemptively(PARSE_TIMEOUT, () -> {
-                    result[0] = authenticatorReturning(tokenResponseWith(bareJwtOf(claims))).processCallback(getMockRequest(), "the-code");
+                    result[0] = authenticatorReturning(tokenResponseWith(bareJwtOf(claims))).processCallback(getMockRequest(), "the-code",
+                            NONCE);
                 }, "the callback never returned: " + claims);
             } finally {
                 appender.detach();
@@ -1549,7 +1553,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("https://user:s3cr3t@idp.invalid/token#frag");
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
         try {
-            assertNull(remote.processCallback(getMockRequest(), "the-code"));
+            assertNull(remote.processCallback(getMockRequest(), "the-code", NONCE));
         } finally {
             appender.detach();
         }
@@ -1568,5 +1572,154 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
                 "{\"a\":1}" }) {
             assertNull(callbackWith(jwtOf("{\"email\":" + email + "}")), email);
         }
+    }
+
+    // ===================================================================================
+    //                                                                              Nonce
+    //                                                                              =====
+
+    private LoginCredential[] callbackWithNonce(final Object idToken, final String expectedNonce, final List<String> messages) {
+        final LoginCredential[] result = new LoginCredential[1];
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
+        try {
+            result[0] = authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code", expectedNonce);
+        } finally {
+            appender.detach();
+        }
+        for (final LogEvent event : appender.events()) {
+            messages.add(event.getMessage().getFormattedMessage());
+        }
+        return result;
+    }
+
+    @Test
+    public void test_getAuthUrl_sendsTheNonceItKeepsInTheSession() {
+        final Set<String> nonces = new HashSet<>();
+        for (int i = 0; i < 200; i++) {
+            final HttpServletRequest request = getMockRequest();
+            final String url = authenticator.getAuthUrl(request);
+            final String nonce = (String) request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_NONCE);
+            assertNotNull(nonce, "no nonce was stored in the session");
+            assertTrue(url.contains("nonce=" + nonce), "the nonce is not in the authentication request: " + url);
+            // It is a value of its own, not the state sent in the same request.
+            assertFalse(nonce.equals(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_STATE)));
+            nonces.add(nonce);
+        }
+        assertEquals(200, nonces.size());
+    }
+
+    @Test
+    public void test_processCallback_acceptsATokenCarryingTheExpectedNonce() {
+        final List<String> messages = new ArrayList<>();
+        final LoginCredential[] result = callbackWithNonce(jwtOf("{\"email\":\"user@example.com\"}"), NONCE, messages);
+        assertNotNull(result[0]);
+        assertFalse(String.join("\n", messages).contains("Failed to process"), "a failure was logged: " + messages);
+    }
+
+    @Test
+    public void test_processCallback_withAMismatchedNonce() {
+        final List<String> messages = new ArrayList<>();
+        final LoginCredential[] result =
+                callbackWithNonce(jwtOf("{\"email\":\"user@example.com\",\"nonce\":\"another-nonce\"}"), NONCE, messages);
+        assertNull(result[0]);
+        assertTrue(messages.contains("Failed to process the OpenID Connect callback: The nonce of the ID token is not the one sent in"
+                + " the authentication request."), "the warning differs: " + messages);
+        // Neither the claim nor the session's value reaches the warning.
+        final String logged = String.join("\n", messages);
+        assertFalse(logged.contains("another-nonce"));
+        assertFalse(logged.contains(NONCE));
+    }
+
+    @Test
+    public void test_processCallback_withoutANonceClaim() {
+        final List<String> messages = new ArrayList<>();
+        final LoginCredential[] result = callbackWithNonce(
+                bareJwtOf("{\"aud\":\"" + CLIENT_ID + "\",\"exp\":" + FAR_FUTURE_EXP + ",\"email\":\"user@example.com\"}"), NONCE,
+                messages);
+        assertNull(result[0]);
+        assertTrue(messages.contains("Failed to process the OpenID Connect callback: The ID token has no nonce claim that is a string."),
+                "the warning differs: " + messages);
+    }
+
+    @Test
+    public void test_processCallback_withANonceClaimOfAnotherType() {
+        for (final String nonce : new String[] { "7", "null", "[\"" + NONCE + "\"]", "{\"a\":1}", "true" }) {
+            assertNull(callbackWith(jwtOf("{\"email\":\"user@example.com\",\"nonce\":" + nonce + "}")), nonce);
+        }
+    }
+
+    @Test
+    public void test_processCallback_withoutAnExpectedNonce() {
+        // The session held none: a token that carries a nonce still cannot be tied to this login.
+        for (final String expected : new String[] { null, "", " " }) {
+            final List<String> messages = new ArrayList<>();
+            final LoginCredential[] result = callbackWithNonce(jwtOf("{\"email\":\"user@example.com\"}"), expected, messages);
+            assertNull(result[0], "expected=" + expected);
+            assertTrue(messages.contains("Failed to process the OpenID Connect callback: No nonce was issued for this login, so the ID"
+                    + " token cannot be matched to it."), "the warning differs: " + messages);
+        }
+        // A token without any nonce does not slip through when the session has none either.
+        assertNull(authenticatorReturning(tokenResponseWith(jwtOf("{\"nonce\":null}"))).processCallback(getMockRequest(), "c", null));
+    }
+
+    @Test
+    public void test_getLoginCredential_acceptsTheCallbackOfItsOwnRequestAndConsumesTheNonce() {
+        final OpenIdConnectAuthenticator local = authenticatorReturning(tokenResponseWith(jwtOf("{\"email\":\"user@example.com\"}")));
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_NONCE, NONCE);
+        request.setParameter("state", "the-state");
+        request.setParameter("code", "the-code");
+
+        final LoginCredential credential = local.getLoginCredential();
+        assertNotNull(credential);
+        assertFalse(credential instanceof ActionResponseCredential);
+        assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_STATE));
+        assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_NONCE));
+
+        // The same callback again -- a replay -- finds neither value and gets no credential: the flow starts over.
+        final LoginCredential replay = local.getLoginCredential();
+        assertTrue(replay instanceof ActionResponseCredential, "a replayed callback logged in");
+    }
+
+    @Test
+    public void test_getLoginCredential_aMismatchedNonceIsRefusedAndStillConsumed() {
+        final OpenIdConnectAuthenticator local =
+                authenticatorReturning(tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"nonce\":\"another-nonce\"}")));
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_NONCE, NONCE);
+        request.setParameter("state", "the-state");
+        request.setParameter("code", "the-code");
+
+        assertNull(local.getLoginCredential());
+        assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_NONCE));
+        // Retrying the same callback cannot be matched to anything any more.
+        assertTrue(local.getLoginCredential() instanceof ActionResponseCredential);
+    }
+
+    @Test
+    public void test_getLoginCredential_theNonceIsDroppedWhenTheStateDoesNotMatch() {
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_NONCE, NONCE);
+        request.setParameter("state", "a-different-state");
+        request.setParameter("code", "the-code");
+
+        // The old nonce is gone; the redirect that starts the fresh request issues its own.
+        assertTrue(authenticator.getLoginCredential() instanceof ActionResponseCredential);
+        assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_NONCE));
+    }
+
+    @Test
+    public void test_getLoginCredential_aCallbackWithoutTheSessionNonceIsRefused() {
+        // A session that has the state but no nonce, as one started before the nonce was added has.
+        final OpenIdConnectAuthenticator local = authenticatorReturning(tokenResponseWith(jwtOf("{\"email\":\"user@example.com\"}")));
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.setParameter("state", "the-state");
+        request.setParameter("code", "the-code");
+
+        assertNull(local.getLoginCredential());
     }
 }
