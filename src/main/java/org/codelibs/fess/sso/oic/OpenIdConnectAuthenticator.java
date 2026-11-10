@@ -33,7 +33,9 @@ import org.codelibs.core.misc.DynamicProperties;
 import org.codelibs.fess.app.web.base.login.ActionResponseCredential;
 import org.codelibs.fess.app.web.base.login.FessLoginAssist.LoginCredentialResolver;
 import org.codelibs.fess.crawler.Constants;
+import org.codelibs.fess.session.SessionDataSerializer;
 import org.codelibs.fess.sso.SsoAuthenticator;
+import org.codelibs.fess.sso.oic.OpenIdConnectCredential.OpenIdUser;
 import org.codelibs.fess.util.ComponentUtil;
 import org.dbflute.optional.OptionalEntity;
 import org.dbflute.optional.OptionalThing;
@@ -96,11 +98,23 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     /** Configuration key for OpenID Connect client secret. */
     protected static final String OIC_CLIENT_SECRET = "oic.client.secret";
 
+    /** The name of the component that serializes the session attributes for the session store. */
+    protected static final String SESSION_DATA_SERIALIZER = "sessionDataSerializer";
+
     /** Session key for OpenID Connect state parameter. */
     protected static final String OIC_STATE = "OIC_STATE";
 
     /** Session key for OpenID Connect nonce parameter. */
     protected static final String OIC_NONCE = "OIC_NONCE";
+
+    /**
+     * Session key for the time, in epoch milliseconds, the state and the nonce were issued at. A
+     * {@link Long}, so that it is shared between nodes like the two values it belongs to.
+     */
+    protected static final String OIC_ISSUED_AT = "OIC_ISSUED_AT";
+
+    /** How long, in milliseconds, a login may take between the authorization request and its callback. */
+    protected static final long MAX_LOGIN_MILLIS = 10 * 60 * 1000L;
 
     /** Configuration key for OpenID Connect base URL. */
     protected static final String OIC_BASE_URL = "oic.base.url";
@@ -138,6 +152,26 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
             logger.debug("Initializing {}", this.getClass().getSimpleName());
         }
         ComponentUtil.getSsoManager().register(this);
+        registerSessionSerializer();
+    }
+
+    /**
+     * Lets the session store share the logged-in user between nodes, when this Fess has one. It runs after the
+     * registration above, so a failure here cannot take the login down; the user is then kept on the node that
+     * logged them in. The class is registered whether or not the store is selected, because the format version
+     * of the store depends on the registered classes and has to be the same on every node.
+     */
+    protected void registerSessionSerializer() {
+        if (!ComponentUtil.hasComponent(SESSION_DATA_SERIALIZER)) {
+            return;
+        }
+        try {
+            ComponentUtil.<SessionDataSerializer> getComponent(SESSION_DATA_SERIALIZER)
+                    .register(OpenIdUser.class, new OpenIdUserSerializer());
+        } catch (final RuntimeException e) {
+            logger.warn("The OpenID Connect user is not shared between nodes by the session store, and the nodes will not agree"
+                    + " on the format of the stored sessions: {}", e.getMessage());
+        }
     }
 
     @Override
@@ -153,6 +187,11 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                 // callback answers, and neither may serve a second callback.
                 final String sesNonce = (String) session.getAttribute(OIC_NONCE);
                 session.removeAttribute(OIC_NONCE);
+                // The third of the values of one authorization request. A session that was started by a node
+                // without it has none, and then only the lifetime of the session limits the login.
+                final Object issuedAt = session.getAttribute(OIC_ISSUED_AT);
+                session.removeAttribute(OIC_ISSUED_AT);
+                final boolean expired = issuedAt instanceof final Long time && System.currentTimeMillis() - time > MAX_LOGIN_MILLIS;
                 if (StringUtil.isNotBlank(sesState)) {
                     session.removeAttribute(OIC_STATE);
                     final String code = request.getParameter("code");
@@ -161,7 +200,13 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                         logger.debug("code: {}, state(request): {}, state(session): {}", sanitizeForLog(code), sanitizeForLog(reqState),
                                 sesState);
                     }
-                    if (sesState.equals(reqState)) {
+                    if (expired) {
+                        logger.warn("The OpenID Connect callback came more than {} seconds after the authorization request.",
+                                MAX_LOGIN_MILLIS / 1000);
+                        if (StringUtil.isNotBlank(code)) {
+                            ComponentUtil.getActivityHelper().loginFailure(OptionalThing.empty());
+                        }
+                    } else if (sesState.equals(reqState)) {
                         final String error = request.getParameter("error");
                         if (StringUtil.isNotBlank(error)) {
                             // The provider answered this login with an error response (RFC 6749 section
@@ -230,6 +275,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
         final HttpSession session = request.getSession();
         session.setAttribute(OIC_STATE, state);
         session.setAttribute(OIC_NONCE, nonce);
+        session.setAttribute(OIC_ISSUED_AT, System.currentTimeMillis());
         return new AuthorizationCodeRequestUrl(getOicAuthServerUrl(), getOicClientId())//
                 .setScopes(Arrays.asList(getOicScope()))//
                 .setResponseTypes(Arrays.asList("code"))//
