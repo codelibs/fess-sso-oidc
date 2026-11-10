@@ -36,10 +36,12 @@ import org.apache.logging.log4j.core.LogEvent;
 import org.codelibs.core.io.FileUtil;
 import org.codelibs.core.misc.DynamicProperties;
 import org.codelibs.fess.app.web.base.login.ActionResponseCredential;
+import org.codelibs.fess.helper.ActivityHelper;
 import org.codelibs.fess.unit.LogCapturingAppender;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
 import org.dbflute.utflute.mocklet.MockletHttpServletRequest;
+import org.dbflute.optional.OptionalThing;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
@@ -59,6 +61,8 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
 
     private OpenIdConnectAuthenticator authenticator;
     private DynamicProperties systemProperties;
+    /** The LOGIN_FAILURE records written during the test. */
+    private int loginFailures;
 
     @Override
     protected void setUp(TestInfo testInfo) throws Exception {
@@ -69,6 +73,13 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         FileUtil.writeBytes(propFile.getAbsolutePath(), "".getBytes("UTF-8"));
         systemProperties = new DynamicProperties(propFile);
         ComponentUtil.register(systemProperties, "systemProperties");
+        ComponentUtil.register(new ActivityHelper() {
+            @Override
+            public void loginFailure(final OptionalThing<LoginCredential> credential) {
+                assertFalse(credential.isPresent());
+                loginFailures++;
+            }
+        }, "activityHelper");
     }
 
     @Test
@@ -504,6 +515,45 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final LoginCredential credential = authenticator.getLoginCredential();
         assertNotNull(credential);
         assertTrue(credential instanceof ActionResponseCredential);
+    }
+
+    @Test
+    public void test_getLoginCredential_aCodeWithAnotherStateIsRecordedAsFailedLogin() {
+        // The refused callback still gets a fresh authorization request, and the audit log gets the one
+        // LOGIN_FAILURE record that the other refusals get through the caller.
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.setParameter("state", "a-different-state");
+        request.setParameter("code", "the-code");
+
+        assertTrue(authenticator.getLoginCredential() instanceof ActionResponseCredential);
+        assertEquals(1, loginFailures);
+    }
+
+    @Test
+    public void test_getLoginCredential_withoutACodeNothingIsRecordedAsFailedLogin() {
+        // A second visit to /sso/ before the callback, a bare callback and an error for another state carry
+        // no code, so no login was refused.
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        assertTrue(authenticator.getLoginCredential() instanceof ActionResponseCredential);
+
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.setParameter("state", "a-different-state");
+        request.setParameter("error", "access_denied");
+        assertTrue(authenticator.getLoginCredential() instanceof ActionResponseCredential);
+        assertEquals(0, loginFailures);
+    }
+
+    @Test
+    public void test_getLoginCredential_aCodeWithoutASessionStateIsNotRecordedAsFailedLogin() {
+        // No state in the session is an expired or a new session: it restarts the login, as before.
+        final MockletHttpServletRequest request = getMockRequest();
+        request.setParameter("state", "a-different-state");
+        request.setParameter("code", "the-code");
+
+        assertTrue(authenticator.getLoginCredential() instanceof ActionResponseCredential);
+        assertEquals(0, loginFailures);
     }
 
     @Test
