@@ -36,6 +36,7 @@ import org.codelibs.fess.crawler.Constants;
 import org.codelibs.fess.sso.SsoAuthenticator;
 import org.codelibs.fess.util.ComponentUtil;
 import org.dbflute.optional.OptionalEntity;
+import org.dbflute.optional.OptionalThing;
 import org.lastaflute.web.login.credential.LoginCredential;
 import org.lastaflute.web.response.HtmlResponse;
 import org.lastaflute.web.util.LaRequestUtil;
@@ -176,6 +177,13 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                         if (StringUtil.isNotBlank(code)) {
                             return processCallback(request, code, sesNonce);
                         }
+                    } else if (StringUtil.isNotBlank(code)) {
+                        // A callback that carries a code but not the state of this session is a refused
+                        // login (a forged or replayed callback, or one from a login this session no longer
+                        // waits for). The caller still gets a fresh authorization request below, as before;
+                        // this only leaves the record of it that the null returns above leave through the
+                        // caller. Nothing the anonymous caller sent is written to it.
+                        ComponentUtil.getActivityHelper().loginFailure(OptionalThing.empty());
                     }
                 }
             }
