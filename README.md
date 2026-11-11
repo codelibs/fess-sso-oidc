@@ -137,6 +137,13 @@ Fess merges from every jar on the class path:
   resolve — and what makes `sso.type=oidc` resolve to nothing. It is a singleton, because the
   authenticator registers that instance with `ssoManager` from its `init()`.
 
+When Fess keeps its HTTP sessions in OpenSearch (`FESS_SESSION_STORE=opensearch`), `init()` also
+registers the logged-in user with the session store, so a login started on one node can end on
+another and the user stays logged in on all of them. Only the user name, groups and roles are
+stored; no token of the login is. Run the same plugins on every node: the stored format depends on
+the registered classes, and a node with a different set does not read the sessions of the others.
+A login has to be completed within 10 minutes of its authorization request.
+
 The `SsoAuthenticator` interface, `SsoManager`, `SsoAction` and the SSO section of the
 administration screen remain in Fess. Only the authenticator and the credential it hands to
 `FessLoginAssist` ship here; the libraries they compile against are supplied by the war, so this

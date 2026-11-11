@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE components PUBLIC "-//DBFLUTE//DTD LastaDi 1.0//EN"
+	"http://dbflute.org/meta/lastadi10.dtd">
+<components>
+	<!-- What the web application has of Fess for this plugin: fess_sso.xml, which this plugin's
+	     fess_sso++.xml merges into, and the serializer of the session store that app.xml declares. -->
+	<include path="fess_sso.xml" />
+	<component name="sessionDataSerializer" class="org.codelibs.fess.session.SessionDataSerializer" />
+</components>
