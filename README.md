@@ -114,9 +114,10 @@ Six things are worth knowing before the first login:
 * **PKCE (RFC 7636) is on.** Every authorization request carries a `code_challenge` with
   `code_challenge_method=S256`, derived from a random `code_verifier` that stays in the session
   next to the `state` and `nonce`; the token request sends the verifier, and the provider refuses
-  the code without it. A provider that requires PKCE for the client therefore works, and one that
-  does not require it ignores it. Only a provider that rejects the unknown `code_challenge`
-  parameter needs `oic.pkce=false`, which sends neither parameter. The setting is read for each
+  the code without it. A provider that requires PKCE for the client therefore works. One that
+  supports PKCE without requiring it enforces the verifier once a challenge is sent, which this
+  plugin always does, and one that does not support it ignores the parameters. Only a provider that
+  rejects the unknown `code_challenge` parameter needs `oic.pkce=false`, which sends neither parameter. The setting is read for each
   login, so it takes effect without a restart. A login that was started without a challenge (PKCE
   off, or a node that predates it) is completed without a verifier; one that was started with a
   challenge fails if a node without PKCE completes it, so update every node before a login relies
