@@ -17,8 +17,13 @@ package org.codelibs.fess.sso.oic;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -107,6 +112,9 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     /** Session key for OpenID Connect nonce parameter. */
     protected static final String OIC_NONCE = "OIC_NONCE";
 
+    /** Session key for the PKCE code verifier (RFC 7636) of the pending authorization request. */
+    protected static final String OIC_CODE_VERIFIER = "OIC_CODE_VERIFIER";
+
     /**
      * Session key for the time, in epoch milliseconds, the state and the nonce were issued at. A
      * {@link Long}, so that it is shared between nodes like the two values it belongs to.
@@ -118,6 +126,15 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
 
     /** Configuration key for OpenID Connect base URL. */
     protected static final String OIC_BASE_URL = "oic.base.url";
+
+    /**
+     * Configuration key that turns PKCE (RFC 7636) off when set to {@code false}. Any other value, and an absent
+     * key, leave it on.
+     */
+    protected static final String OIC_PKCE = "oic.pkce";
+
+    /** The number of random bytes of a code verifier; the 43 characters they encode to are the minimum RFC 7636 allows. */
+    protected static final int CODE_VERIFIER_BYTES = 32;
 
     /** Configuration key for the issuer identifier the ID token's {@code iss} claim is compared with. */
     protected static final String OIC_ISSUER = "oic.issuer";
@@ -133,6 +150,9 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
 
     /** A dotted-quad address in 127.0.0.0/8, each octet in decimal without leading zeros. */
     private static final Pattern LOOPBACK_IPV4 = Pattern.compile("127(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}");
+
+    /** Source of the code verifiers. */
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     /** Set once the log has said that {@code oic.issuer} is not configured. */
     private final AtomicBoolean issuerNotConfiguredLogged = new AtomicBoolean();
@@ -187,6 +207,9 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                 // callback answers, and neither may serve a second callback.
                 final String sesNonce = (String) session.getAttribute(OIC_NONCE);
                 session.removeAttribute(OIC_NONCE);
+                // The PKCE verifier belongs to the same authorization request, and is dropped just the same.
+                final String sesCodeVerifier = (String) session.getAttribute(OIC_CODE_VERIFIER);
+                session.removeAttribute(OIC_CODE_VERIFIER);
                 // The third of the values of one authorization request. A session that was started by a node
                 // without it has none, and then only the lifetime of the session limits the login.
                 final Object issuedAt = session.getAttribute(OIC_ISSUED_AT);
@@ -220,7 +243,7 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                             return null;
                         }
                         if (StringUtil.isNotBlank(code)) {
-                            return processCallback(request, code, sesNonce);
+                            return processCallback(request, code, sesNonce, sesCodeVerifier);
                         }
                     } else if (StringUtil.isNotBlank(code)) {
                         // A callback that carries a code but not the state of this session is a refused
@@ -276,13 +299,65 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
         session.setAttribute(OIC_STATE, state);
         session.setAttribute(OIC_NONCE, nonce);
         session.setAttribute(OIC_ISSUED_AT, System.currentTimeMillis());
-        return new AuthorizationCodeRequestUrl(getOicAuthServerUrl(), getOicClientId())//
+        final AuthorizationCodeRequestUrl url = new AuthorizationCodeRequestUrl(getOicAuthServerUrl(), getOicClientId())//
                 .setScopes(Arrays.asList(getOicScope()))//
                 .setResponseTypes(Arrays.asList("code"))//
                 .setRedirectUri(getOicRedirectUrl())//
-                .setState(state)//
-                .set("nonce", nonce)//
-                .build();
+                .setState(state);
+        url.set("nonce", nonce);
+        if (isOicPkceEnabled()) {
+            // PKCE (RFC 7636) binds the authorization code to this session: the provider keeps the
+            // challenge, and only the holder of the verifier can redeem the code at the token endpoint.
+            // The verifier stays in the session and never leaves the server until the token request.
+            final String codeVerifier = generateCodeVerifier();
+            session.setAttribute(OIC_CODE_VERIFIER, codeVerifier);
+            url.set("code_challenge", createCodeChallenge(codeVerifier));
+            url.set("code_challenge_method", "S256");
+        } else {
+            // Not left over from an earlier request of this session, which would send a verifier for a
+            // challenge this request never made.
+            session.removeAttribute(OIC_CODE_VERIFIER);
+        }
+        return url.build();
+    }
+
+    /**
+     * Creates a PKCE code verifier: {@value #CODE_VERIFIER_BYTES} random bytes, base64url-encoded without
+     * padding, which is 43 characters from the unreserved set (RFC 7636 section 4.1).
+     *
+     * @return a new code verifier
+     */
+    protected String generateCodeVerifier() {
+        final byte[] bytes = new byte[CODE_VERIFIER_BYTES];
+        SECURE_RANDOM.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /**
+     * Derives the {@code S256} code challenge of a verifier: the base64url-encoded SHA-256 of its ASCII
+     * bytes, without padding (RFC 7636 section 4.2).
+     *
+     * @param codeVerifier the code verifier
+     * @return the code challenge
+     */
+    protected static String createCodeChallenge(final String codeVerifier) {
+        try {
+            final byte[] digest = MessageDigest.getInstance("SHA-256").digest(codeVerifier.getBytes(StandardCharsets.US_ASCII));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+        } catch (final NoSuchAlgorithmException e) {
+            // Every Java platform has to provide SHA-256.
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Tells whether the authorization request carries a PKCE challenge. It does unless {@code oic.pkce} is
+     * set to {@code false}.
+     *
+     * @return false only if PKCE is turned off
+     */
+    protected boolean isOicPkceEnabled() {
+        return !"false".equalsIgnoreCase(ComponentUtil.getSystemProperties().getProperty(OIC_PKCE, "true").trim());
     }
 
     /**
@@ -311,11 +386,14 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      * @param request the HTTP servlet request
      * @param code the authorization code
      * @param expectedNonce the nonce sent in this login's authentication request (may be null)
+     * @param codeVerifier the PKCE code verifier whose challenge this login's authentication request carried
+     *        (null or blank if it carried none)
      * @return the login credential
      */
-    protected LoginCredential processCallback(final HttpServletRequest request, final String code, final String expectedNonce) {
+    protected LoginCredential processCallback(final HttpServletRequest request, final String code, final String expectedNonce,
+            final String codeVerifier) {
         try {
-            final TokenResponse tr = getTokenUrl(code);
+            final TokenResponse tr = getTokenUrl(code, codeVerifier);
 
             // Everything below reads a document the provider controls. Each malformed shape has to end
             // as a returned null, which the caller turns into the SSO login error, and not as a thrown
@@ -645,20 +723,26 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      * Gets the token response from the OpenID Connect provider.
      *
      * @param code the authorization code
+     * @param codeVerifier the PKCE code verifier of the authorization request, sent as {@code code_verifier}
+     *        (null or blank if the request carried no challenge, and then nothing is sent)
      * @return the token response
      * @throws IOException if an I/O error occurs, or the token response is cut off
      * @throws IllegalArgumentException if the token server URL is not acceptable, see {@link #requireSecureTokenEndpoint(String)}
      */
-    protected TokenResponse getTokenUrl(final String code) throws IOException {
+    protected TokenResponse getTokenUrl(final String code, final String codeVerifier) throws IOException {
         final String tokenServerUrl = getOicTokenServerUrl();
         requireSecureTokenEndpoint(tokenServerUrl);
         try {
-            return new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, toGenericUrl(tokenServerUrl), code)//
-                    .setGrantType("authorization_code")//
-                    .setRedirectUri(getOicRedirectUrl())//
-                    .set("client_id", getOicClientId())//
-                    .set("client_secret", getOicClientSecret())//
-                    .execute();
+            final AuthorizationCodeTokenRequest request =
+                    new AuthorizationCodeTokenRequest(httpTransport, jsonFactory, toGenericUrl(tokenServerUrl), code)//
+                            .setGrantType("authorization_code")//
+                            .setRedirectUri(getOicRedirectUrl());
+            request.set("client_id", getOicClientId());
+            request.set("client_secret", getOicClientSecret());
+            if (StringUtil.isNotBlank(codeVerifier)) {
+                request.set("code_verifier", codeVerifier);
+            }
+            return request.execute();
         } catch (final NullPointerException e) {
             // The JSON parser of the HTTP client dereferences the missing token when the response ends
             // right after a field name or its colon. Every other truncation is an IOException, so this

@@ -21,6 +21,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.codelibs.core.io.FileUtil;
 import org.codelibs.core.misc.DynamicProperties;
@@ -52,6 +53,7 @@ public class OpenIdConnectSessionSharingTest extends UnitFessTestCase {
     private int loginFailures;
 
     private final AtomicInteger tokenRequests = new AtomicInteger();
+    private final AtomicReference<String> lastCodeVerifier = new AtomicReference<>();
 
     @Override
     protected void setUp(final TestInfo testInfo) throws Exception {
@@ -88,8 +90,9 @@ public class OpenIdConnectSessionSharingTest extends UnitFessTestCase {
         tr.set("id_token", b64.apply("{\"alg\":\"RS256\"}") + "." + b64.apply(claims) + "." + b64.apply("signature"));
         return new OpenIdConnectAuthenticator() {
             @Override
-            protected TokenResponse getTokenUrl(final String code) {
+            protected TokenResponse getTokenUrl(final String code, final String codeVerifier) {
                 tokenRequests.incrementAndGet();
+                lastCodeVerifier.set(codeVerifier);
                 return tr;
             }
 
@@ -150,9 +153,10 @@ public class OpenIdConnectSessionSharingTest extends UnitFessTestCase {
         final byte[] issued = store(nodeA, request.getSession());
 
         final Map<String, Object> shared = loaded(nodeB, issued);
-        // the three values of the authorization request are what the other node gets
+        // the values of the authorization request are what the other node gets
         assertNotNull(shared.get(OpenIdConnectAuthenticator.OIC_STATE));
         assertNotNull(shared.get(OpenIdConnectAuthenticator.OIC_NONCE));
+        assertNotNull(shared.get(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER));
         assertTrue(shared.get(OpenIdConnectAuthenticator.OIC_ISSUED_AT) instanceof Long);
 
         load(nodeB, issued, request);
@@ -162,6 +166,8 @@ public class OpenIdConnectSessionSharingTest extends UnitFessTestCase {
         assertTrue(credential instanceof OpenIdConnectCredential);
         assertEquals("taro@example.com", ((OpenIdConnectCredential) credential).getUserId());
         assertEquals(1, tokenRequests.get());
+        // the node that redeems the code holds the verifier the first node made
+        assertEquals(shared.get(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER), lastCodeVerifier.get());
     }
 
     @Test
