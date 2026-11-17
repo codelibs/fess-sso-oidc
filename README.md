@@ -55,6 +55,7 @@ Then configure the client registered with the OpenID provider:
 | `oic.client.id` | the client ID |
 | `oic.client.secret` | the client secret |
 | `oic.issuer` | the issuer identifier the ID token's `iss` claim has to equal; optional, see below. `system.properties` only: the administration screen has no field for it |
+| `oic.pkce` | `false` turns PKCE off; any other value, and an absent key, leave it on. Optional, see below. `system.properties` only: the administration screen has no field for it |
 | `oic.scope` | the requested scopes, space-separated; the provider needs `openid` and Fess needs `email` |
 | `oic.redirect.url` | the redirect URI; `{oic.base.url}/sso/` is used when the key is absent |
 | `oic.base.url` | the Fess base URL the redirect URI is built from (default `http://localhost:8080`) |
@@ -66,10 +67,10 @@ read from the provider's `/.well-known/openid-configuration`.
 
 A `-Dfess.system.<key>=...` on the JVM command line reaches `oic.default.groups` and
 `oic.default.roles` only, and there only for a key `system.properties` does not hold. The other
-eight are read straight from the `systemProperties` component, which never consults JVM system
+nine are read straight from the `systemProperties` component, which never consults JVM system
 properties: for those, the file or the administration screen is the only channel.
 
-Five things are worth knowing before the first login:
+Six things are worth knowing before the first login:
 
 * **The user id is the `email` claim.** An ID token without one, or whose `email` is not a string,
   is refused with a warning naming `oic.scope`, and no session is created — so `email` has to be
@@ -109,7 +110,18 @@ Five things are worth knowing before the first login:
     warning that does not repeat either value. A provider that omits the claim therefore cannot be
     used (OpenID Connect Core requires it to echo the nonce), and there is no setting to relax this.
     A login that was started before the plugin was updated fails once and has to be retried.
-  * PKCE is not implemented, and `iat` and `nbf` are not checked.
+  * `iat` and `nbf` are not checked.
+* **PKCE (RFC 7636) is on.** Every authorization request carries a `code_challenge` with
+  `code_challenge_method=S256`, derived from a random `code_verifier` that stays in the session
+  next to the `state` and `nonce`; the token request sends the verifier, and the provider refuses
+  the code without it. A provider that requires PKCE for the client therefore works. One that
+  supports PKCE without requiring it enforces the verifier once a challenge is sent, which this
+  plugin always does, and one that does not support it ignores the parameters. Only a provider that
+  rejects the unknown `code_challenge` parameter needs `oic.pkce=false`, which sends neither parameter. The setting is read for each
+  login, so it takes effect without a restart. A login that was started without a challenge (PKCE
+  off, or a node that predates it) is completed without a verifier; one that was started with a
+  challenge fails if a node without PKCE completes it, so update every node before a login relies
+  on it.
 * **There is no single logout and no metadata endpoint.** This authenticator implements neither, so
   `/sso/logout` and `/sso/metadata` answer 400 and logging out ends the Fess session only.
 

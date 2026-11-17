@@ -410,7 +410,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     private OpenIdConnectAuthenticator authenticatorReturning(final TokenResponse tr, final String issuer) {
         return new OpenIdConnectAuthenticator() {
             @Override
-            protected TokenResponse getTokenUrl(final String code) {
+            protected TokenResponse getTokenUrl(final String code, final String codeVerifier) {
                 return tr;
             }
 
@@ -427,7 +427,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     }
 
     private LoginCredential callbackWith(final Object idToken) {
-        return authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code", NONCE);
+        return authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code", NONCE, null);
     }
 
     @Test
@@ -661,7 +661,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     private String debugOutputOfCallback(final TokenResponse tr) {
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            authenticatorReturning(tr).processCallback(getMockRequest(), "the-code", NONCE);
+            authenticatorReturning(tr).processCallback(getMockRequest(), "the-code", NONCE, null);
         } finally {
             appender.detach();
         }
@@ -1139,7 +1139,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         // The refusal is an IllegalArgumentException. A request to the host would have ended as an IOException
         // (no such host, connection refused) or as a response, so this proves the check comes first.
         final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("http://idp.invalid/token");
-        Assertions.assertThrows(IllegalArgumentException.class, () -> remote.getTokenUrl("the-code"));
+        Assertions.assertThrows(IllegalArgumentException.class, () -> remote.getTokenUrl("the-code", null));
     }
 
     @Test
@@ -1147,7 +1147,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("http://user:s3cr3t@idp.invalid/token");
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            assertNull(remote.processCallback(getMockRequest(), "the-code", NONCE));
+            assertNull(remote.processCallback(getMockRequest(), "the-code", NONCE, null));
         } finally {
             appender.detach();
         }
@@ -1174,7 +1174,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         try {
             final OpenIdConnectAuthenticator local =
                     authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
-            final LoginCredential credential = local.processCallback(getMockRequest(), "the-code", NONCE);
+            final LoginCredential credential = local.processCallback(getMockRequest(), "the-code", NONCE, null);
             assertNotNull(credential);
             assertEquals("{user@example.com}", credential.toString());
         } finally {
@@ -1216,7 +1216,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
             for (int i = 0; i < full.length(); i++) {
                 body[0] = full.substring(0, i);
                 try {
-                    local.processCallback(getMockRequest(), "the-code", NONCE);
+                    local.processCallback(getMockRequest(), "the-code", NONCE, null);
                 } catch (final RuntimeException e) {
                     escaped.add(i + ": " + e);
                 }
@@ -1235,7 +1235,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         try {
             final OpenIdConnectAuthenticator local =
                     authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token");
-            assertNull(local.processCallback(getMockRequest(), "the-code", NONCE));
+            assertNull(local.processCallback(getMockRequest(), "the-code", NONCE, null));
         } finally {
             appender.detach();
             server.stop(0);
@@ -1274,7 +1274,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         try {
             final OpenIdConnectAuthenticator local = authenticatorWithTokenEndpoint(
                     "http://oicuser:URLPASSWORD@127.0.0.1:" + server.getAddress().getPort() + "/token?api_key=QUERYSECRET");
-            assertNull(local.processCallback(getMockRequest(), "CODEMARKER", NONCE));
+            assertNull(local.processCallback(getMockRequest(), "CODEMARKER", NONCE, null));
         } finally {
             appender.detach();
             server.stop(0);
@@ -1327,13 +1327,14 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     public void test_processCallback_aTokenUrlJavaCannotParseDoesNotRepeatItself() {
         // new GenericUrl(String) reports the parse error of java.net.URL, which quotes a part of the URL.
         final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("https://oicuser:URLPASSWORD@host:99999999999/token");
-        final IllegalArgumentException e = Assertions.assertThrows(IllegalArgumentException.class, () -> remote.getTokenUrl("the-code"));
+        final IllegalArgumentException e =
+                Assertions.assertThrows(IllegalArgumentException.class, () -> remote.getTokenUrl("the-code", null));
         assertEquals("oic.token.server.url is not a valid URL", e.getMessage());
         assertNull(e.getCause());
         final OpenIdConnectAuthenticator quoted = authenticatorWithTokenEndpoint("https://oicuser:URLPASSWORD:x/token");
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            assertNull(quoted.processCallback(getMockRequest(), "the-code", NONCE));
+            assertNull(quoted.processCallback(getMockRequest(), "the-code", NONCE, null));
         } finally {
             appender.detach();
         }
@@ -1349,7 +1350,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     private List<String> loggedByCallback(final OpenIdConnectAuthenticator authenticator, final LoginCredential[] result) {
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
         try {
-            result[0] = authenticator.processCallback(getMockRequest(), "the-code", NONCE);
+            result[0] = authenticator.processCallback(getMockRequest(), "the-code", NONCE, null);
         } finally {
             appender.detach();
         }
@@ -1417,19 +1418,19 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final TokenResponse tr = tokenResponseWith(jwtOf("{\"email\":\"user@example.com\"}"));
         final OpenIdConnectAuthenticator unconfigured = new OpenIdConnectAuthenticator() {
             @Override
-            protected TokenResponse getTokenUrl(final String code) {
+            protected TokenResponse getTokenUrl(final String code, final String codeVerifier) {
                 return tr;
             }
         };
-        assertNull(unconfigured.processCallback(getMockRequest(), "the-code", NONCE));
+        assertNull(unconfigured.processCallback(getMockRequest(), "the-code", NONCE, null));
     }
 
     @Test
     public void test_processCallback_withTheIssuerOfAnotherProvider() {
         final TokenResponse tr = tokenResponseWith(jwtOf("{\"email\":\"user@example.com\",\"iss\":\"https://other.example.com\"}"));
-        assertNull(authenticatorReturning(tr, ISSUER).processCallback(getMockRequest(), "the-code", NONCE));
+        assertNull(authenticatorReturning(tr, ISSUER).processCallback(getMockRequest(), "the-code", NONCE, null));
         // The same token is accepted while nothing is configured.
-        assertNotNull(authenticatorReturning(tr, "").processCallback(getMockRequest(), "the-code", NONCE));
+        assertNotNull(authenticatorReturning(tr, "").processCallback(getMockRequest(), "the-code", NONCE, null));
     }
 
     @Test
@@ -1527,7 +1528,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
             try {
                 Assertions.assertTimeoutPreemptively(PARSE_TIMEOUT, () -> {
                     result[0] = authenticatorReturning(tokenResponseWith(bareJwtOf(claims))).processCallback(getMockRequest(), "the-code",
-                            NONCE);
+                            NONCE, null);
                 }, "the callback never returned: " + claims);
             } finally {
                 appender.detach();
@@ -1603,7 +1604,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final OpenIdConnectAuthenticator remote = authenticatorWithTokenEndpoint("https://user:s3cr3t@idp.invalid/token#frag");
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
         try {
-            assertNull(remote.processCallback(getMockRequest(), "the-code", NONCE));
+            assertNull(remote.processCallback(getMockRequest(), "the-code", NONCE, null));
         } finally {
             appender.detach();
         }
@@ -1632,7 +1633,8 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         final LoginCredential[] result = new LoginCredential[1];
         final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.WARN);
         try {
-            result[0] = authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code", expectedNonce);
+            result[0] =
+                    authenticatorReturning(tokenResponseWith(idToken)).processCallback(getMockRequest(), "the-code", expectedNonce, null);
         } finally {
             appender.detach();
         }
@@ -1709,7 +1711,7 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
                     + " token cannot be matched to it."), "the warning differs: " + messages);
         }
         // A token without any nonce does not slip through when the session has none either.
-        assertNull(authenticatorReturning(tokenResponseWith(jwtOf("{\"nonce\":null}"))).processCallback(getMockRequest(), "c", null));
+        assertNull(authenticatorReturning(tokenResponseWith(jwtOf("{\"nonce\":null}"))).processCallback(getMockRequest(), "c", null, null));
     }
 
     @Test
@@ -1771,5 +1773,227 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
         request.setParameter("code", "the-code");
 
         assertNull(local.getLoginCredential());
+    }
+
+    // ===================================================================================
+    //                                                                                PKCE
+    //                                                                                ====
+    /** The query parameters of an authorization URL, decoded. */
+    private static Map<String, String> queryOf(final String url) {
+        final Map<String, String> params = new HashMap<>();
+        for (final String pair : url.substring(url.indexOf('?') + 1).split("&")) {
+            // an empty value is written without the "="
+            final int eq = pair.indexOf('=') < 0 ? pair.length() : pair.indexOf('=');
+            params.put(java.net.URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8),
+                    eq == pair.length() ? "" : java.net.URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
+        }
+        return params;
+    }
+
+    @Test
+    public void test_createCodeChallenge_isTheS256OfTheVerifier() {
+        // The worked example of RFC 7636 appendix B.
+        assertEquals("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                OpenIdConnectAuthenticator.createCodeChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"));
+    }
+
+    @Test
+    public void test_generateCodeVerifier_isUnreservedAndNeverRepeats() {
+        final Set<String> verifiers = new HashSet<>();
+        for (int i = 0; i < 200; i++) {
+            final String verifier = authenticator.generateCodeVerifier();
+            // RFC 7636 section 4.1: 43 to 128 characters of [A-Za-z0-9-._~]
+            assertTrue(verifier.matches("[A-Za-z0-9\\-._~]{43,128}"), "not a code verifier: " + verifier);
+            verifiers.add(verifier);
+        }
+        assertEquals(200, verifiers.size());
+    }
+
+    @Test
+    public void test_getAuthUrl_carriesTheS256ChallengeOfTheVerifierInTheSession() {
+        final HttpServletRequest request = getMockRequest();
+
+        final Map<String, String> query = queryOf(authenticator.getAuthUrl(request));
+
+        final String verifier = (String) request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER);
+        assertNotNull(verifier, "no verifier was kept for the callback");
+        assertEquals("S256", query.get("code_challenge_method"));
+        assertEquals(OpenIdConnectAuthenticator.createCodeChallenge(verifier), query.get("code_challenge"));
+        assertFalse(query.containsValue(verifier), "the verifier went out in the authorization request");
+        // what the request carried before PKCE is still there
+        assertEquals("code", query.get("response_type"));
+        assertEquals(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_STATE), query.get("state"));
+        assertEquals(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_NONCE), query.get("nonce"));
+    }
+
+    @Test
+    public void test_getAuthUrl_issuesANewVerifierPerRequest() {
+        final HttpServletRequest request = getMockRequest();
+        authenticator.getAuthUrl(request);
+        final String first = (String) request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER);
+        authenticator.getAuthUrl(request);
+        final String second = (String) request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER);
+
+        assertFalse(first.equals(second), "the verifier was reused");
+    }
+
+    @Test
+    public void test_getAuthUrl_withPkceTurnedOff() {
+        for (final String off : new String[] { "false", "FALSE", "  false " }) {
+            ComponentUtil.getSystemProperties().setProperty(OpenIdConnectAuthenticator.OIC_PKCE, off);
+            final HttpServletRequest request = getMockRequest();
+            // a verifier left by an earlier request of the session must not outlive this one
+            request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER, "stale");
+
+            final Map<String, String> query = queryOf(authenticator.getAuthUrl(request));
+
+            assertFalse(query.containsKey("code_challenge"), off);
+            assertFalse(query.containsKey("code_challenge_method"), off);
+            assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER), off);
+            // and nothing else changed
+            assertNotNull(query.get("state"));
+            assertNotNull(query.get("nonce"));
+        }
+    }
+
+    @Test
+    public void test_getAuthUrl_pkceStaysOnUnlessTheKeyIsFalse() {
+        // absent is covered by the tests above; a value that is not "false" must not switch it off
+        for (final String on : new String[] { "true", "", "  ", "0", "no", "off" }) {
+            ComponentUtil.getSystemProperties().setProperty(OpenIdConnectAuthenticator.OIC_PKCE, on);
+            final Map<String, String> query = queryOf(authenticator.getAuthUrl(getMockRequest()));
+            Assertions.assertEquals("S256", query.get("code_challenge_method"), "'" + on + "'");
+        }
+    }
+
+    /** An authenticator whose token endpoint is a stub that notes the verifier it is given. */
+    private OpenIdConnectAuthenticator verifierRecording(final String[] seen, final int[] calls) {
+        return new OpenIdConnectAuthenticator() {
+            @Override
+            protected TokenResponse getTokenUrl(final String code, final String codeVerifier) {
+                calls[0]++;
+                seen[0] = codeVerifier;
+                return tokenResponseWith(jwtOf("{\"email\":\"user@example.com\"}"));
+            }
+
+            @Override
+            protected String getOicClientId() {
+                return CLIENT_ID;
+            }
+
+            @Override
+            protected String getOicIssuer() {
+                return "";
+            }
+        };
+    }
+
+    @Test
+    public void test_getLoginCredential_redeemsTheCodeWithTheVerifierOfThisLogin() {
+        final MockletHttpServletRequest request = getMockRequest();
+        authenticator.getAuthUrl(request);
+        final String verifier = (String) request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER);
+        // the stub's token carries NONCE, so the session has to hold it for the callback to succeed
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_NONCE, NONCE);
+        request.setParameter("state", (String) request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_STATE));
+        request.setParameter("code", "the-code");
+        final String[] seen = new String[1];
+        final int[] calls = new int[1];
+
+        final LoginCredential credential = verifierRecording(seen, calls).getLoginCredential();
+
+        assertTrue(credential instanceof OpenIdConnectCredential);
+        assertEquals(1, calls[0]);
+        assertEquals(verifier, seen[0]);
+        // consumed with the state, so a replayed callback cannot reuse it
+        assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER));
+    }
+
+    @Test
+    public void test_getLoginCredential_dropsTheVerifierOfARefusedCallback() {
+        final MockletHttpServletRequest request = getMockRequest();
+        authenticator.getAuthUrl(request);
+        request.setParameter("state", "not-the-state");
+        request.setParameter("code", "the-code");
+        final int[] calls = new int[1];
+
+        final LoginCredential credential = verifierRecording(new String[1], calls).getLoginCredential();
+
+        // the same outcome as before PKCE: a fresh authorization request, and no token request
+        assertTrue(credential instanceof ActionResponseCredential);
+        assertEquals(0, calls[0]);
+        assertNull(request.getSession().getAttribute(OpenIdConnectAuthenticator.OIC_CODE_VERIFIER));
+    }
+
+    @Test
+    public void test_getLoginCredential_withoutAVerifierSendsNone() {
+        // a login that began without a challenge (PKCE off, or started by a node that predates it)
+        final MockletHttpServletRequest request = getMockRequest();
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_STATE, "the-state");
+        request.getSession().setAttribute(OpenIdConnectAuthenticator.OIC_NONCE, NONCE);
+        request.setParameter("state", "the-state");
+        request.setParameter("code", "the-code");
+        final String[] seen = { "unset" };
+        final int[] calls = new int[1];
+
+        final LoginCredential credential = verifierRecording(seen, calls).getLoginCredential();
+
+        assertTrue(credential instanceof OpenIdConnectCredential);
+        assertEquals(1, calls[0]);
+        assertNull(seen[0]);
+    }
+
+    /** The form the token endpoint received, decoded; the stub answers with a valid token. */
+    private Map<String, String> tokenRequestSentWith(final String codeVerifier) throws IOException {
+        final String body = "{\"access_token\":\"access-token\",\"token_type\":\"Bearer\",\"expires_in\":300}";
+        final Map<String, String> form = new HashMap<>();
+        final HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0);
+        server.createContext("/token", exchange -> {
+            final String received = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            for (final String pair : received.split("&")) {
+                final int eq = pair.indexOf('=') < 0 ? pair.length() : pair.indexOf('=');
+                form.put(java.net.URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8),
+                        eq == pair.length() ? "" : java.net.URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
+            }
+            final byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        server.start();
+        try {
+            authenticatorWithTokenEndpoint("http://127.0.0.1:" + server.getAddress().getPort() + "/token").getTokenUrl("the-code",
+                    codeVerifier);
+        } finally {
+            server.stop(0);
+        }
+        return form;
+    }
+
+    @Test
+    public void test_getTokenUrl_sendsTheVerifierWithTheRestOfTheTokenRequest() throws IOException {
+        final Map<String, String> form = tokenRequestSentWith("the-verifier");
+
+        assertEquals("the-verifier", form.get("code_verifier"));
+        // the request of before PKCE, unchanged
+        assertEquals("authorization_code", form.get("grant_type"));
+        assertEquals("the-code", form.get("code"));
+        assertEquals(CLIENT_ID, form.get("client_id"));
+        assertTrue(form.containsKey("client_secret"));
+        assertTrue(form.containsKey("redirect_uri"));
+    }
+
+    @Test
+    public void test_getTokenUrl_withoutAVerifierSendsNoCodeVerifier() throws IOException {
+        for (final String none : new String[] { null, "", "  " }) {
+            final Map<String, String> form = tokenRequestSentWith(none);
+
+            assertFalse(form.containsKey("code_verifier"), "'" + none + "'");
+            assertEquals("authorization_code", form.get("grant_type"));
+            assertEquals("the-code", form.get("code"));
+            assertEquals(CLIENT_ID, form.get("client_id"));
+        }
     }
 }
