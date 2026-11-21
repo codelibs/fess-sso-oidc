@@ -24,7 +24,9 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -40,11 +42,16 @@ import org.codelibs.fess.app.web.base.login.FessLoginAssist.LoginCredentialResol
 import org.codelibs.fess.crawler.Constants;
 import org.codelibs.fess.session.SessionDataSerializer;
 import org.codelibs.fess.sso.SsoAuthenticator;
+import org.codelibs.fess.sso.SsoResponseType;
+import org.codelibs.fess.sso.oic.LogoutTokenValidator.LogoutToken;
+import org.codelibs.fess.sso.oic.LogoutTokenValidator.LogoutTokenException;
 import org.codelibs.fess.sso.oic.OpenIdConnectCredential.OpenIdUser;
 import org.codelibs.fess.util.ComponentUtil;
+import org.codelibs.fess.util.LogUtil;
 import org.dbflute.optional.OptionalEntity;
 import org.dbflute.optional.OptionalThing;
 import org.lastaflute.web.login.credential.LoginCredential;
+import org.lastaflute.web.response.ActionResponse;
 import org.lastaflute.web.response.HtmlResponse;
 import org.lastaflute.web.util.LaRequestUtil;
 
@@ -53,6 +60,8 @@ import com.google.api.client.auth.oauth2.AuthorizationCodeTokenRequest;
 import com.google.api.client.auth.oauth2.TokenResponse;
 import com.google.api.client.auth.oauth2.TokenResponseException;
 import com.google.api.client.http.GenericUrl;
+import com.google.api.client.http.HttpRequest;
+import com.google.api.client.http.HttpResponse;
 import com.google.api.client.http.HttpResponseException;
 import com.google.api.client.http.HttpTransport;
 import com.google.api.client.http.javanet.NetHttpTransport;
@@ -65,6 +74,7 @@ import com.google.common.io.BaseEncoding.DecodingException;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
 
 /**
@@ -102,6 +112,35 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
 
     /** Configuration key for OpenID Connect client secret. */
     protected static final String OIC_CLIENT_SECRET = "oic.client.secret";
+
+    /** The name this authenticator is registered under, which is {@code <sso.type>Authenticator}. */
+    protected static final String COMPONENT_NAME = "oicAuthenticator";
+
+    /** Configuration key for the {@code jwks_uri} of the provider, which turns back-channel logout on. */
+    protected static final String OIC_JWKS_URI = "oic.jwks.uri";
+
+    /** The form parameter that carries the logout token of back-channel logout. */
+    protected static final String LOGOUT_TOKEN_PARAMETER = "logout_token";
+
+    /**
+     * How long a node trusts what it last read about a logout, in milliseconds. It is how long another node may take to
+     * end a session after the node that received the logout.
+     */
+    protected static final long REVOCATION_CHECK_MILLIS = 30 * 1000L;
+
+    /**
+     * The most logouts a node remembers having looked up. A session asks for up to two keys (its {@code sid} and its
+     * {@code sub}), and an entry that is evicted while its session is still active is looked up in the index again, on
+     * the request path. An entry is a 64 character key and two numbers, about 250 bytes, so 100,000 of them are some 25 MB at
+     * most and keep every key of 50,000 concurrent sessions in memory.
+     */
+    protected static final int MAX_CACHED_REVOCATIONS = 100_000;
+
+    /** The longest JWKS document read, in bytes. */
+    protected static final int MAX_JWKS_BYTES = 512 * 1024;
+
+    /** The time the connection to the provider may take, for the JWKS document, in milliseconds. */
+    protected static final int JWKS_TIMEOUT_MILLIS = 5000;
 
     /** The name of the component that serializes the session attributes for the session store. */
     protected static final String SESSION_DATA_SERIALIZER = "sessionDataSerializer";
@@ -156,6 +195,26 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
 
     /** Set once the log has said that {@code oic.issuer} is not configured. */
     private final AtomicBoolean issuerNotConfiguredLogged = new AtomicBoolean();
+
+    /** Where the logouts received by any node and the logout tokens already used are kept. */
+    protected LogoutRevocationStore revocationStore = new LogoutRevocationStore();
+
+    /** The signature keys of the provider. */
+    protected final JwksKeySource jwksKeySource =
+            new JwksKeySource(this::getOicJwksUri, this::fetchJwks, this::parseJsonObject, this::currentTimeMillis);
+
+    /** Validates the logout token of back-channel logout. */
+    protected final LogoutTokenValidator logoutTokenValidator = new LogoutTokenValidator(this::parseJsonObject, jwksKeySource);
+
+    /** What this node last read about a logout, by key: the time of the logout or -1, and when it was read. */
+    private final Map<String, long[]> revocationCache = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected boolean removeEldestEntry(final Map.Entry<String, long[]> eldest) {
+            return size() > MAX_CACHED_REVOCATIONS;
+        }
+    });
 
     /** HTTP transport for OpenID Connect requests. */
     protected final HttpTransport httpTransport = new NetHttpTransport();
@@ -788,12 +847,16 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     }
 
     private static GenericUrl toGenericUrl(final String url) {
+        return toGenericUrl(url, OIC_TOKEN_SERVER_URL);
+    }
+
+    private static GenericUrl toGenericUrl(final String url, final String key) {
         try {
             return new GenericUrl(url);
         } catch (final IllegalArgumentException e) {
             // Dropped, not chained: the message of the MalformedURLException inside repeats part of the URL,
             // which may carry credentials.
-            throw new IllegalArgumentException(OIC_TOKEN_SERVER_URL + " is not a valid URL");
+            throw new IllegalArgumentException(key + " is not a valid URL");
         }
     }
 
@@ -811,13 +874,24 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      *         carries a fragment; the message does not repeat the URL, which may carry credentials
      */
     protected void requireSecureTokenEndpoint(final String url) {
+        requireSecureUrl(url, OIC_TOKEN_SERVER_URL);
+    }
+
+    /**
+     * Refuses an endpoint that is not reached over TLS, by the rule of {@link #requireSecureTokenEndpoint(String)}.
+     * The keys that verify a logout token are only as trustworthy as the way they were fetched.
+     *
+     * @param url the URL (may be null)
+     * @param key the name of the setting that holds it, which the message names instead of the URL
+     * @throws IllegalArgumentException if the URL is not https, or http for another host than a loopback one, or carries a fragment
+     */
+    protected void requireSecureUrl(final String url, final String key) {
         if (!isSecureTokenEndpoint(url)) {
-            throw new IllegalArgumentException(
-                    OIC_TOKEN_SERVER_URL + " must be https (http is accepted only for localhost, 127.x.x.x and ::1)");
+            throw new IllegalArgumentException(key + " must be https (http is accepted only for localhost, 127.x.x.x and ::1)");
         }
         // The URL parsed as a URI above, where a '#' can only begin the fragment.
         if (url.indexOf('#') >= 0) {
-            throw new IllegalArgumentException(OIC_TOKEN_SERVER_URL + " must not contain a #fragment");
+            throw new IllegalArgumentException(key + " must not contain a #fragment");
         }
     }
 
@@ -923,6 +997,213 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
      */
     protected String getOicAuthServerUrl() {
         return ComponentUtil.getSystemProperties().getProperty(OIC_AUTH_SERVER_URL, "https://accounts.google.com/o/oauth2/auth");
+    }
+
+    /**
+     * Gets the {@code jwks_uri} of the provider, where the keys that sign its logout tokens are.
+     *
+     * @return the URI, trimmed; empty when back-channel logout is not turned on
+     */
+    protected String getOicJwksUri() {
+        return ComponentUtil.getSystemProperties().getProperty(OIC_JWKS_URI, StringUtil.EMPTY).trim();
+    }
+
+    // ===================================================================================
+    //                                                            Back-Channel Logout 1.0
+    //                                                            ======================
+
+    @Override
+    public ActionResponse getResponse(final SsoResponseType responseType) {
+        if (responseType != SsoResponseType.LOGOUT) {
+            return null;
+        }
+        // Only a POST that carries a logout token is back-channel logout; anything else keeps the answer it had,
+        // which is that this authenticator has no single logout endpoint.
+        return LaRequestUtil.getOptionalRequest()
+                .filter(request -> "POST".equalsIgnoreCase(request.getMethod()) && request.getParameter(LOGOUT_TOKEN_PARAMETER) != null)
+                .map(this::handleBackchannelLogout)
+                .orElse(null);
+    }
+
+    /**
+     * Answers an OpenID Connect Back-Channel Logout 1.0 request: records that the login the token names has ended at
+     * the provider, so that every node ends the session when it next looks at it.
+     *
+     * <p>The answer is {@code 200} if the logout was recorded and {@code 400} otherwise, an empty body either way and
+     * {@code Cache-Control: no-store} (section 2.8). The endpoint is anonymous, so a refused request is logged in one
+     * line with the failed check and nothing of the token.</p>
+     *
+     * @param request the request
+     * @return the response
+     */
+    protected ActionResponse handleBackchannelLogout(final HttpServletRequest request) {
+        try {
+            if (StringUtil.isBlank(getOicJwksUri())) {
+                // Every installation of this authenticator has no such key until it turns the feature on, and the endpoint
+                // is anonymous: one message per JVM, not one per request.
+                logRefusal("jwks-unset", OIC_JWKS_URI + " is not set, so back-channel logout is not turned on.");
+                return logoutAnswer(HttpServletResponse.SC_BAD_REQUEST);
+            }
+            final long now = currentTimeMillis();
+            final LogoutToken token = logoutTokenValidator.validate(request.getParameter(LOGOUT_TOKEN_PARAMETER), getOicIssuer(),
+                    getOicClientId(), now / 1000);
+            final String tokenKey = LogoutRevocationStore.tokenKey(token.issuer(), token.jti());
+            if (!revocationStore.markTokenUsed(tokenKey, now)) {
+                throw new LogoutTokenException("The logout token was used before.");
+            }
+            try {
+                // A session id names one session. Without it the subject names every session of the user, and
+                // the sessions opened after this time are not among them.
+                final String key = token.sessionId() != null ? LogoutRevocationStore.sessionKey(token.issuer(), token.sessionId())
+                        : LogoutRevocationStore.subjectKey(token.issuer(), token.subject());
+                revocationStore.revoke(key, now);
+                revocationCache.put(key, new long[] { now, now });
+            } catch (final RuntimeException e) {
+                // The provider may send the token again, and has to be able to.
+                try {
+                    revocationStore.forgetToken(tokenKey);
+                } catch (final RuntimeException ignored) {
+                    logger.debug("The logout token could not be forgotten.", ignored);
+                }
+                throw e;
+            }
+            if (logger.isInfoEnabled()) {
+                logger.info("Recorded a back-channel logout: by={}", token.sessionId() != null ? "sid" : "sub");
+            }
+            return logoutAnswer(HttpServletResponse.SC_OK);
+        } catch (final LogoutTokenException e) {
+            // The message names the failed check and nothing of the token, so it is also the kind of the refusal.
+            logRefusal(e.getMessage(), e.getMessage());
+        } catch (final RuntimeException e) {
+            logRefusal("failure:" + e.getClass().getName(),
+                    "Failed to process a back-channel logout request: " + sanitizeForLog(e.getMessage()));
+            if (logger.isDebugEnabled()) {
+                logger.debug("Failed to process a back-channel logout request.", e);
+            }
+        }
+        return logoutAnswer(HttpServletResponse.SC_BAD_REQUEST);
+    }
+
+    /**
+     * Logs a refused back-channel logout request. The endpoint is anonymous, so anyone can make a refusal: the first of
+     * each kind is a warning, the rest are debug messages.
+     *
+     * @param kind what the refusals that are the same have in common
+     * @param message the message, which holds nothing of the token
+     */
+    private static void logRefusal(final String kind, final String message) {
+        if (!LogUtil.warnOnce(logger, "backchannel-logout:" + kind,
+                "Refused a back-channel logout request (the next ones of this kind" + " are logged at debug level): {}", message)
+                && logger.isDebugEnabled()) {
+            logger.debug("Refused a back-channel logout request: {}", message);
+        }
+    }
+
+    private static ActionResponse logoutAnswer(final int status) {
+        return HtmlResponse.asEmptyBody().httpStatus(status).header("Cache-Control", "no-store");
+    }
+
+    /**
+     * Tells whether the provider has logged a login out through back-channel logout.
+     *
+     * <p>Asked when the session is looked up, by every request of a logged-in user ({@code FessUser#isExpired}). The
+     * answer comes from this node's memory for {@value #REVOCATION_CHECK_MILLIS} ms and from the coordinator index after
+     * that, so a logout recorded by another node is seen within that time. A login is ended if its {@code sid} was logged
+     * out, or if its {@code sub} was logged out after the login was opened. If the index cannot be read nothing is ended:
+     * the session of a user is not worth more than a provider that says nothing.</p>
+     *
+     * @param user the user of the session
+     * @return true if the login has ended
+     */
+    public boolean isLoginRevoked(final OpenIdUser user) {
+        final String issuer = user.getIssuer();
+        if (issuer == null || StringUtil.isBlank(getOicJwksUri())) {
+            return false;
+        }
+        final long now = currentTimeMillis();
+        if (user.getSessionId() != null && findRevokedAt(LogoutRevocationStore.sessionKey(issuer, user.getSessionId()), now) >= 0) {
+            return true;
+        }
+        if (user.getSubject() != null) {
+            final long revokedAt = findRevokedAt(LogoutRevocationStore.subjectKey(issuer, user.getSubject()), now);
+            return revokedAt >= 0 && user.getLoginTime() <= revokedAt;
+        }
+        return false;
+    }
+
+    /**
+     * Returns the current time.
+     *
+     * @return the current time in milliseconds
+     */
+    protected long currentTimeMillis() {
+        return System.currentTimeMillis();
+    }
+
+    private long findRevokedAt(final String key, final long now) {
+        final long[] cached = revocationCache.get(key);
+        if (cached != null && now - cached[1] < REVOCATION_CHECK_MILLIS) {
+            return cached[0];
+        }
+        // If the index cannot be read, the last answer stands (not logged out when there is none): this runs on the request
+        // path of every user, so a failing, slow or missing index must neither fail the request nor end the sessions.
+        long revokedAt = cached != null ? cached[0] : -1;
+        try {
+            revokedAt = revocationStore.findRevokedAt(key, now);
+        } catch (final RuntimeException e) {
+            // Remembered like an answer, so that a failing index is not asked again by every request.
+            LogUtil.warnOnce(logger, "revocation-lookup",
+                    "Could not look up the back-channel logouts, so no session is ended by one" + " until the index can be read: {}",
+                    sanitizeForLog(e.getClass().getSimpleName() + " " + e.getMessage()));
+        }
+        revocationCache.put(key, new long[] { revokedAt, now });
+        return revokedAt;
+    }
+
+    /**
+     * Reads a JSON object.
+     *
+     * @param json the text
+     * @return the members of the object
+     * @throws IllegalArgumentException if the text is not a JSON object
+     */
+    protected Map<String, Object> parseJsonObject(final String json) {
+        try (final JsonParser jsonParser = jsonFactory.createJsonParser(json)) {
+            jsonParser.nextToken();
+            return parseObject(jsonParser);
+        } catch (final IOException | RuntimeException e) {
+            throw new IllegalArgumentException("The text is not a JSON object.");
+        }
+    }
+
+    /**
+     * Reads the JWKS document of the provider.
+     *
+     * @param url the {@code jwks_uri}
+     * @return the document
+     * @throws IllegalStateException if the URL is not acceptable (see {@link #requireSecureUrl(String, String)}) or the
+     *         document cannot be read; the message says why and does not repeat the URL, which may carry credentials
+     */
+    protected String fetchJwks(final String url) {
+        try {
+            requireSecureUrl(url, OIC_JWKS_URI);
+            final HttpRequest request = httpTransport.createRequestFactory()
+                    .buildGetRequest(toGenericUrl(url, OIC_JWKS_URI))
+                    .setFollowRedirects(false)
+                    .setConnectTimeout(JWKS_TIMEOUT_MILLIS)
+                    .setReadTimeout(JWKS_TIMEOUT_MILLIS)
+                    .setNumberOfRetries(0);
+            final HttpResponse response = request.execute();
+            try {
+                return JwksKeySource.readLimited(response.getContent(), MAX_JWKS_BYTES);
+            } finally {
+                response.disconnect();
+            }
+        } catch (final HttpResponseException e) {
+            throw new IllegalStateException("The JWKS endpoint answered HTTP " + e.getStatusCode() + ".");
+        } catch (final IOException | IllegalArgumentException e) {
+            throw new IllegalStateException("The JWKS document could not be read: " + e.getClass().getSimpleName());
+        }
     }
 
     @Override

@@ -30,8 +30,9 @@ import com.esotericsoftware.kryo.io.Output;
  * Writes an {@link OpenIdUser} for the OpenSearch-backed session store, so that a user who logged in
  * through OpenID Connect on one node is logged in on the others.
  *
- * <p>Only what authorization reads is written: the user name, the group names and the role names. The
- * permissions are not written, because {@link OpenIdUser#getPermissions()} derives them from those three
+ * <p>Only what authorization reads is written: the user name, the group names and the role names; and what a
+ * back-channel logout finds the login by: the issuer, the subject and the session id of the ID token, and the time
+ * the login was opened. The permissions are not written, because {@link OpenIdUser#getPermissions()} derives them from those three
  * when they are first asked for, so a restored user can never hold a permission the names do not give.
  * Nothing of the token response is part of the user, so no ID token, access token or refresh token is
  * written, and nothing reads one after a login.</p>
@@ -44,8 +45,11 @@ import com.esotericsoftware.kryo.io.Output;
  */
 public class OpenIdUserSerializer extends Serializer<OpenIdUser> {
 
-    /** The number of the layout written. Change it with the layout; an older layout is refused. */
-    protected static final int LAYOUT = 1;
+    /**
+     * The number of the layout written. Change it with the layout. Layout 1, which has the name, the groups and
+     * the roles only, is still read: the user it describes has no identifiers, and no back-channel logout finds it.
+     */
+    protected static final int LAYOUT = 2;
 
     /** The most group names, or role names, that are written or read. */
     protected static final int MAX_ENTRIES = 10_000;
@@ -69,12 +73,16 @@ public class OpenIdUserSerializer extends Serializer<OpenIdUser> {
         writeText(output, user.getName());
         writeTexts(output, user.getGroupNames());
         writeTexts(output, user.getRoleNames());
+        writeOptionalText(output, user.getIssuer());
+        writeOptionalText(output, user.getSubject());
+        writeOptionalText(output, user.getSessionId());
+        output.writeVarLong(Math.max(0L, user.getLoginTime()), true);
     }
 
     @Override
     public OpenIdUser read(final Kryo kryo, final Input input, final Class<? extends OpenIdUser> type) {
         final int layout = input.readVarInt(true);
-        if (layout != LAYOUT) {
+        if (layout != LAYOUT && layout != 1) {
             throw new KryoException("The layout of the OpenID Connect user is not supported: " + layout);
         }
         final String name = readText(input);
@@ -83,7 +91,46 @@ public class OpenIdUserSerializer extends Serializer<OpenIdUser> {
         }
         final String[] groups = readTexts(input);
         final String[] roles = readTexts(input);
-        return new OpenIdUser(name, groups, roles);
+        if (layout == 1) {
+            return new OpenIdUser(name, groups, roles);
+        }
+        final String issuer = readOptionalText(input);
+        final String subject = readOptionalText(input);
+        final String sessionId = readOptionalText(input);
+        final long loginTime = input.readVarLong(true);
+        return new OpenIdUser(name, groups, roles, issuer, subject, sessionId, loginTime);
+    }
+
+    /**
+     * Writes a text that may be absent: zero for none, otherwise one and the text.
+     *
+     * @param output the output
+     * @param text the text, or null
+     */
+    protected static void writeOptionalText(final Output output, final String text) {
+        if (text == null) {
+            output.writeVarInt(0, true);
+            return;
+        }
+        output.writeVarInt(1, true);
+        writeText(output, text);
+    }
+
+    /**
+     * Reads a text written by {@link #writeOptionalText(Output, String)}.
+     *
+     * @param input the input
+     * @return the text, or null
+     */
+    protected static String readOptionalText(final Input input) {
+        final int marker = input.readVarInt(true);
+        if (marker == 0) {
+            return null;
+        }
+        if (marker != 1) {
+            throw new KryoException("The marker of an optional text is invalid: " + marker);
+        }
+        return readText(input);
     }
 
     /**
