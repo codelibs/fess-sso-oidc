@@ -279,6 +279,34 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
     }
 
     /**
+     * Finds the first character of a user name that a name must not contain.
+     *
+     * <p>The email claim is the user name and the key of the permissions, so it is kept as the provider sent it or
+     * not used at all. A line break, a TAB or another control character in it would be copied into every log line
+     * and screen that shows the name. The characters refused are those of {@link Character#isISOControl(int)}
+     * (Unicode {@code Cc}) and the line and paragraph separators {@code U+2028} and {@code U+2029} ({@code Zl},
+     * {@code Zp}). Spaces inside the name, letters of any script and punctuation such as {@code @}, {@code +}
+     * and {@code '} are not touched.</p>
+     *
+     * @param name The name the provider sent.
+     * @return A description of the first refused character that does not repeat the name, or null if there is none.
+     */
+    protected static String describeControlCharacter(final String name) {
+        if (name == null) {
+            return null;
+        }
+        for (int i = 0; i < name.length();) {
+            final int codePoint = name.codePointAt(i);
+            final int type = Character.getType(codePoint);
+            if (Character.isISOControl(codePoint) || type == Character.LINE_SEPARATOR || type == Character.PARAGRAPH_SEPARATOR) {
+                return String.format("the control character U+%04X at position %d of %d", codePoint, i, name.length());
+            }
+            i += Character.charCount(codePoint);
+        }
+        return null;
+    }
+
+    /**
      * Gets the authorization URL for OpenID Connect.
      *
      * @param request the HTTP servlet request
@@ -457,6 +485,12 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                 // the session has to be refused here rather than created and left unusable.
                 logger.warn("The ID token has no email claim that is a string, which is the user id. Check that {} requests it.",
                         OIC_SCOPE);
+                return null;
+            }
+            final String unusable = describeControlCharacter(credential.getUserId());
+            if (unusable != null) {
+                logger.warn("The email claim, which is the user id, contains {}. It is used as the user name exactly as the provider"
+                        + " sent it, so it is not rewritten and the login is refused.", unusable);
                 return null;
             }
             return credential;

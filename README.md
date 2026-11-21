@@ -74,8 +74,11 @@ Six things are worth knowing before the first login:
 
 * **The user id is the `email` claim.** An ID token without one, or whose `email` is not a string,
   is refused with a warning naming `oic.scope`, and no session is created — so `email` has to be
-  among the scopes the provider grants, and the account has to have an address. The user id is
-  also what a document ACL has to name for role-based search to match.
+  among the scopes the provider grants, and the account has to have an address. The address is used
+  exactly as the provider sent it, so one that contains a control character (a line break, a TAB,
+  `U+0085`, and the like, or `U+2028` / `U+2029`) is refused as well, with a warning that names
+  the character and its position and not the value. The user id is also what a document ACL has to
+  name for role-based search to match.
 * **Groups come from the `groups` claim, verbatim.** There is no directory lookup and no expansion
   of nested groups, so which groups arrive is entirely up to the provider's claim configuration; a
   provider that emits full paths sends `/parent/child`, which does not match a document tagged with
