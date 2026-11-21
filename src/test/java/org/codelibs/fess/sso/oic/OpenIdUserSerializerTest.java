@@ -178,7 +178,6 @@ public class OpenIdUserSerializerTest extends UnitFessTestCase {
         claims.put("jwtclaim", "JWT-CLAIM-MARKER");
         claims.put("jwtsignature", "JWT-SIGNATURE-MARKER");
         claims.put("id_token", "ID-TOKEN-MARKER");
-        claims.put("sub", "SUBJECT-MARKER");
 
         final byte[] bytes = serializer.toBytes(attributes(new FessUserBean(new OpenIdConnectCredential(claims).getUser())));
 
@@ -186,9 +185,94 @@ public class OpenIdUserSerializerTest extends UnitFessTestCase {
         assertTrue(contains(bytes, EMAIL));
         assertTrue(contains(bytes, "dev"));
         for (final String marker : new String[] { "ACCESS-TOKEN-MARKER", "REFRESH-TOKEN-MARKER", "JWT-HEADER-MARKER", "JWT-CLAIM-MARKER",
-                "JWT-SIGNATURE-MARKER", "ID-TOKEN-MARKER", "SUBJECT-MARKER" }) {
+                "JWT-SIGNATURE-MARKER", "ID-TOKEN-MARKER" }) {
             assertFalse(contains(bytes, marker), marker);
         }
+    }
+
+    // ===================================================================================
+    //                                                       What a back-channel logout needs
+    //                                                       ================================
+    @Test
+    public void test_theIdentifiersOfTheLoginAreStoredForBackchannelLogout() {
+        final Map<String, Object> claims = new HashMap<>();
+        claims.put("email", EMAIL);
+        claims.put("iss", "https://idp.example.com/realm");
+        claims.put("sub", "SUBJECT-MARKER");
+        claims.put("sid", "SESSION-MARKER");
+        claims.put("accesstoken", "ACCESS-TOKEN-MARKER");
+
+        final byte[] bytes = serializer.toBytes(attributes(new FessUserBean(new OpenIdConnectCredential(claims).getUser())));
+        final OpenIdUser restored = (OpenIdUser) ((FessUserBean) serializer.fromBytes(bytes).get(USER_BEAN)).getFessUser();
+
+        assertEquals("https://idp.example.com/realm", restored.getIssuer());
+        assertEquals("SUBJECT-MARKER", restored.getSubject());
+        assertEquals("SESSION-MARKER", restored.getSessionId());
+        assertTrue(restored.getLoginTime() > 0);
+        assertFalse(contains(bytes, "ACCESS-TOKEN-MARKER"));
+    }
+
+    @Test
+    public void test_aLoginWithoutIdentifiersIsStoredWithoutThem() {
+        final OpenIdUser restored = (OpenIdUser) roundTrip(user(EMAIL, new String[] { "dev" }, new String[0]));
+
+        assertNull(restored.getIssuer());
+        assertNull(restored.getSubject());
+        assertNull(restored.getSessionId());
+        assertEquals(0L, restored.getLoginTime());
+    }
+
+    @Test
+    public void test_anIdentifierThatIsNotAnIdentifierIsLeftOut() {
+        final Map<String, Object> claims = new HashMap<>();
+        claims.put("email", EMAIL);
+        claims.put("sub", "x".repeat(OpenIdUser.MAX_IDENTIFIER_LENGTH + 1));
+        claims.put("sid", 42L);
+        claims.put("iss", "");
+
+        final OpenIdUser user = new OpenIdConnectCredential(claims).getUser();
+
+        assertNull(user.getSubject());
+        assertNull(user.getSessionId());
+        assertNull(user.getIssuer());
+        // and the login can still be stored
+        assertNotNull(roundTrip(user));
+    }
+
+    @Test
+    public void test_aLoginStoredBeforeTheIdentifiersExistedIsStillRead() {
+        final byte[] bytes = serializer.toBytes(attributes(new FessUserBean(user(EMAIL, new String[] { "dev" }, new String[0]))));
+        // layout 1: the name, the groups and the roles, nothing after them
+        final Output layout1 = new Output(64, -1);
+        layout1.writeVarInt(1, true);
+        layout1.writeVarInt(EMAIL.length(), true);
+        layout1.writeBytes(EMAIL.getBytes(StandardCharsets.UTF_8));
+        layout1.writeVarInt(2, true);
+        layout1.writeVarInt(3, true);
+        layout1.writeBytes("dev".getBytes(StandardCharsets.UTF_8));
+        layout1.writeVarInt(1, true);
+
+        final FessUserBean restored = (FessUserBean) serializer.fromBytes(replaceUser(bytes, layout1.toBytes())).get(USER_BEAN);
+
+        assertNotNull(restored);
+        assertEquals(EMAIL, restored.getUserId());
+        assertEquals(Arrays.asList("dev"), Arrays.asList(restored.getGroups()));
+        assertEquals(0, restored.getRoles().length);
+        assertNull(((OpenIdUser) restored.getFessUser()).getSessionId());
+    }
+
+    @Test
+    public void test_aDamagedMarkerOfAnIdentifierDropsTheLogin() {
+        final byte[] bytes = serializer.toBytes(attributes(new FessUserBean(user(EMAIL, new String[0], new String[0]))));
+        final Output damaged = new Output(64, -1);
+        damaged.writeVarInt(OpenIdUserSerializer.LAYOUT, true);
+        damaged.writeVarInt(EMAIL.length(), true);
+        damaged.writeBytes(EMAIL.getBytes(StandardCharsets.UTF_8));
+        damaged.writeVarInt(0, true);
+        damaged.writeVarInt(0, true);
+        damaged.writeVarInt(7, true); // neither absent nor present
+
+        assertUserDropped(bytes, damaged.toBytes());
     }
 
     @Test

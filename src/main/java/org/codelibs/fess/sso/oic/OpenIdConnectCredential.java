@@ -86,7 +86,23 @@ public class OpenIdConnectCredential implements LoginCredential, FessCredential 
      * @return the OpenID Connect user
      */
     public OpenIdUser getUser() {
-        return new OpenIdUser(getUserId(), getUserGroups(), getDefaultRolesAsArray());
+        return new OpenIdUser(getUserId(), getUserGroups(), getDefaultRolesAsArray(), identifier("iss"), identifier("sub"),
+                identifier("sid"), System.currentTimeMillis());
+    }
+
+    /**
+     * Reads a claim that identifies the login at the provider: the issuer, the subject or the session id. These are
+     * what a back-channel logout names, and are kept with the login to be found by it.
+     *
+     * @param name the claim
+     * @return the claim, or null if it is not a non-empty string of at most {@value OpenIdUser#MAX_IDENTIFIER_LENGTH}
+     *         characters. A longer one is no identifier any provider issues, and is left out so that it cannot make
+     *         the session impossible to store.
+     */
+    protected String identifier(final String name) {
+        return attributes.get(name) instanceof final String value && !value.isEmpty() && value.length() <= OpenIdUser.MAX_IDENTIFIER_LENGTH
+                ? value
+                : null;
     }
 
     /**
@@ -131,6 +147,21 @@ public class OpenIdConnectCredential implements LoginCredential, FessCredential 
         /** The user roles. */
         protected String[] roles;
 
+        /** The longest issuer, subject or session id kept with the login, in characters. */
+        public static final int MAX_IDENTIFIER_LENGTH = 1024;
+
+        /** The issuer of the ID token that opened this login, or null if it is not known. */
+        protected final String issuer;
+
+        /** The {@code sub} of the ID token, or null if it is not known. */
+        protected final String subject;
+
+        /** The {@code sid} of the ID token, which names the session at the provider, or null if the token has none. */
+        protected final String sessionId;
+
+        /** The time this login was opened, in epoch milliseconds, or 0 if it is not known. */
+        protected final long loginTime;
+
         /**
          * The user permissions.
          *
@@ -151,9 +182,82 @@ public class OpenIdConnectCredential implements LoginCredential, FessCredential 
          * @param roles the user roles
          */
         protected OpenIdUser(final String name, final String[] groups, final String[] roles) {
+            this(name, groups, roles, null, null, null, 0L);
+        }
+
+        /**
+         * Creates a new OpenID Connect user that a back-channel logout can find.
+         *
+         * @param name the user name
+         * @param groups the user groups
+         * @param roles the user roles
+         * @param issuer the issuer of the ID token, or null
+         * @param subject the {@code sub} of the ID token, or null
+         * @param sessionId the {@code sid} of the ID token, or null
+         * @param loginTime the time the login was opened, in epoch milliseconds, or 0
+         */
+        protected OpenIdUser(final String name, final String[] groups, final String[] roles, final String issuer, final String subject,
+                final String sessionId, final long loginTime) {
             this.name = name;
             this.groups = groups;
             this.roles = roles;
+            this.issuer = issuer;
+            this.subject = subject;
+            this.sessionId = sessionId;
+            this.loginTime = loginTime;
+        }
+
+        /**
+         * Gets the issuer of the ID token that opened this login.
+         *
+         * @return the issuer, or null
+         */
+        public String getIssuer() {
+            return issuer;
+        }
+
+        /**
+         * Gets the {@code sub} of the ID token that opened this login.
+         *
+         * @return the subject, or null
+         */
+        public String getSubject() {
+            return subject;
+        }
+
+        /**
+         * Gets the {@code sid} of the ID token that opened this login.
+         *
+         * @return the session id at the provider, or null
+         */
+        public String getSessionId() {
+            return sessionId;
+        }
+
+        /**
+         * Gets the time this login was opened.
+         *
+         * @return the time in epoch milliseconds, or 0 if it is not known
+         */
+        public long getLoginTime() {
+            return loginTime;
+        }
+
+        /**
+         * Tells whether the provider has logged this login out through back-channel logout, which ends the session
+         * here the next time it is looked at. Without {@code oic.jwks.uri} the provider cannot be heard, and this is
+         * always false.
+         *
+         * <p>Not marked {@code @Override}, like the same method of the SAML plugin: a Fess before 15.10 has no such method
+         * to override, and then this is never called.</p>
+         *
+         * @return true if the login has ended at the provider
+         */
+        public boolean isExpired() {
+            if (subject == null && sessionId == null || !ComponentUtil.hasComponent(OpenIdConnectAuthenticator.COMPONENT_NAME)) {
+                return false;
+            }
+            return ComponentUtil.<OpenIdConnectAuthenticator> getComponent(OpenIdConnectAuthenticator.COMPONENT_NAME).isLoginRevoked(this);
         }
 
         @Override

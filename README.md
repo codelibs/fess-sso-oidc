@@ -55,6 +55,7 @@ Then configure the client registered with the OpenID provider:
 | `oic.client.id` | the client ID |
 | `oic.client.secret` | the client secret |
 | `oic.issuer` | the issuer identifier the ID token's `iss` claim has to equal; optional, see below. `system.properties` only: the administration screen has no field for it |
+| `oic.jwks.uri` | the provider's `jwks_uri`; setting it turns on back-channel logout, see below. Optional. `system.properties` only: the administration screen has no field for it |
 | `oic.pkce` | `false` turns PKCE off; any other value, and an absent key, leave it on. Optional, see below. `system.properties` only: the administration screen has no field for it |
 | `oic.scope` | the requested scopes, space-separated; the provider needs `openid` and Fess needs `email` |
 | `oic.redirect.url` | the redirect URI; `{oic.base.url}/sso/` is used when the key is absent |
@@ -122,8 +123,52 @@ Six things are worth knowing before the first login:
   off, or a node that predates it) is completed without a verifier; one that was started with a
   challenge fails if a node without PKCE completes it, so update every node before a login relies
   on it.
-* **There is no single logout and no metadata endpoint.** This authenticator implements neither, so
-  `/sso/logout` and `/sso/metadata` answer 400 and logging out ends the Fess session only.
+* **There is no single logout of the user's own and no metadata endpoint.** `/sso/metadata` and a `/sso/logout`
+  that is not a back-channel logout request answer 400, and logging out ends the Fess session only. The one
+  request `/sso/logout` takes is the provider's, see [Back-channel logout](#back-channel-logout).
+* **An ID token's validity does not limit the session.** Without back-channel logout the Fess session lasts until the
+  user logs out or the session expires from inactivity, whatever happens to the login at the provider.
+
+## Back-channel logout
+
+With [OpenID Connect Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html) the provider
+tells Fess, server to server, that a login has ended, and Fess ends the session of that login. Without it a session
+outlives the login at the provider.
+
+It is on when `oic.jwks.uri` is set and nothing else needs switching: a provider that does not send logout tokens
+does no harm, and without the setting every logout request is answered 400. `oic.issuer` and `oic.client.id` have to be
+set too, because they are what the token is checked against. Copy `jwks_uri` and `issuer` from the provider's
+`/.well-known/openid-configuration`, where `backchannel_logout_supported` says whether the provider can do it. The
+endpoint is the existing `{Fess base URL}/sso/logout`; no other setting is added.
+
+At the provider, register `{Fess base URL}/sso/logout` as the client's *back-channel logout URL*, and, where the provider
+has the option (`backchannel_logout_session_required`), have it send the session id: the provider then ends one
+session and not every session of the user. The ID token has to carry the same `sid`, which Fess keeps with the login.
+
+* **The token is verified**, unlike the ID token: its signature (RS256, RS384, RS512, ES256, ES384 or ES512, with a key of
+  the `jwks_uri` document, which has to be `https`, or `http` on the loopback address like the token endpoint), `iss`
+  (`oic.issuer`), `aud` (`oic.client.id`), `iat` and `exp` (the same 300 seconds of clock skew as for the ID token; a token
+  issued more than an hour ago is refused whatever its `exp`), `jti`, the `events` member
+  `http://schemas.openid.net/event/backchannel-logout`, no `nonce`, and `sid` or `sub`. A token is accepted once:
+  a `jti` that was used is refused on every node.
+* **The answer is `200` when the logout was recorded and `400` otherwise**, with `Cache-Control: no-store`. A request that
+  is not a `POST` with a `logout_token` form parameter is not back-channel logout and gets the answer it always had. The first refusal of each kind
+  is logged as a warning that names the failed check, and the later ones at debug level, because the endpoint is anonymous; no
+  token, `sid` or `sub` is logged. If the logout cannot be recorded
+  the answer is `400` and the same token can be sent again.
+* **A session ends when it is next used.** Fess records the logout in the coordinator index of the search engine
+  (`fess_config.coordinator`), where every node reads it, so it works with in-memory sessions and with
+  `FESS_SESSION_STORE=opensearch` alike. The node that received the request ends the session at once; another node
+  looks at most every 30 seconds, so a session ends there within 30 seconds of the request that follows. The session ends the
+  way a SAML session ends at its `SessionNotOnOrAfter`: locally, with no logout sent back to the provider, and recorded with
+  the other ended sessions in the audit log by Fess versions that record them.
+* **What is ended.** With `sid` in the token, the login that has that `sid`. With `sub` only, every login of that subject
+  opened before the request. A login made before this plugin version, or whose ID token had no `sid` when a `sid`
+  was sent, cannot be found and is not ended.
+* **If the coordinator index cannot be read, no session is ended** (one warning is logged): a failing index is not read as a
+  logout. The time of a login is compared with the time the logout was received, possibly by another node, so the nodes
+  should keep their clocks in step.
+* **Not covered:** encrypted logout tokens (JWE), the Entra ID and SPNEGO authenticators, and front-channel logout.
 
 See the [OpenID Connect SSO documentation](https://fess.codelibs.org/stable/config/sso-oidc.html)
 for the provider side of the registration.
@@ -152,7 +197,7 @@ Fess merges from every jar on the class path:
 When Fess keeps its HTTP sessions in OpenSearch (`FESS_SESSION_STORE=opensearch`), `init()` also
 registers the logged-in user with the session store, so a login started on one node can end on
 another and the user stays logged in on all of them. Only the user name, groups and roles are
-stored; no token of the login is. Run the same plugins on every node: the stored format depends on
+stored, with the issuer, subject and session id of the ID token and the time of the login that back-channel logout finds it by; no token of the login is. Run the same plugins on every node: the stored format depends on
 the registered classes, and a node with a different set does not read the sessions of the others.
 This needs the plugin 15.10 on every node. Adding or removing an SSO plugin changes that set, so it
 invalidates the stored sessions: users log in again.
