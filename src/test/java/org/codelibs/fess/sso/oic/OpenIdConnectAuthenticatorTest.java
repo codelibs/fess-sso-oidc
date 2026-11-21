@@ -2018,4 +2018,118 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
             assertEquals(CLIENT_ID, form.get("client_id"));
         }
     }
+
+    // ===================================================================================
+    //                                                        Control characters in the user id
+    //                                                        =================================
+
+    /** Runs a callback whose email claim is the given JSON string literal body and returns what it logged at WARN. */
+    private List<String> warningsOfCallbackWithEmail(final String emailJson, final boolean expectRefusal) {
+        final LogCapturingAppender appender = LogCapturingAppender.attach(OpenIdConnectAuthenticator.class.getName(), Level.DEBUG);
+        try {
+            final LoginCredential credential = callbackWith(jwtOf("{\"email\":\"" + emailJson + "\"}"));
+            assertEquals(expectRefusal, credential == null);
+            // the reminder that oic.issuer is not set is logged by every callback; it is not what is tested here
+            return appender.warnings().stream().filter(w -> !w.startsWith("oic.issuer is not set")).toList();
+        } finally {
+            appender.detach();
+        }
+    }
+
+    private void assertEmailRefused(final String emailJson, final String code) {
+        final List<String> warnings = warningsOfCallbackWithEmail(emailJson, true);
+
+        assertEquals(1, warnings.size(), String.valueOf(warnings));
+        final String warning = warnings.get(0);
+        assertTrue(warning.startsWith("The email claim, which is the user id, contains the control character " + code + " at"), warning);
+        // the reason is named, the value is not repeated, and nothing in the line can break it
+        assertFalse(warning.contains("example.com"), warning);
+        assertFalse(warning.matches("(?s).*[\\p{Cntrl}\\u0085\\u2028\\u2029].*"), warning);
+    }
+
+    private void assertEmailKept(final String emailJson, final String expectedName) {
+        assertTrue(warningsOfCallbackWithEmail(emailJson, false).isEmpty());
+        final LoginCredential credential = callbackWith(jwtOf("{\"email\":\"" + emailJson + "\"}"));
+        assertEquals("{" + expectedName + "}", credential.toString());
+        assertEquals(expectedName, ((OpenIdConnectCredential) credential).getUserId());
+    }
+
+    @Test
+    public void test_processCallback_withANewLineInTheEmailIsRefused() {
+        assertEmailRefused("ali\\nce@example.com", "U+000A");
+    }
+
+    @Test
+    public void test_processCallback_withATrailingNewLineInTheEmailIsRefused() {
+        assertEmailRefused("alice@example.com\\n", "U+000A");
+    }
+
+    @Test
+    public void test_processCallback_withATabInTheEmailIsRefused() {
+        assertEmailRefused("ali\\tce@example.com", "U+0009");
+    }
+
+    @Test
+    public void test_processCallback_withACarriageReturnInTheEmailIsRefused() {
+        assertEmailRefused("ali\\rce@example.com", "U+000D");
+    }
+
+    @Test
+    public void test_processCallback_withNulInTheEmailIsRefused() {
+        assertEmailRefused("ali\\u0000ce@example.com", "U+0000");
+    }
+
+    @Test
+    public void test_processCallback_withANextLineCharacterInTheEmailIsRefused() {
+        assertEmailRefused("ali\\u0085ce@example.com", "U+0085");
+    }
+
+    @Test
+    public void test_processCallback_withALineSeparatorInTheEmailIsRefused() {
+        assertEmailRefused("ali\\u2028ce@example.com", "U+2028");
+    }
+
+    @Test
+    public void test_processCallback_withAParagraphSeparatorInTheEmailIsRefused() {
+        assertEmailRefused("ali\\u2029ce@example.com", "U+2029");
+    }
+
+    @Test
+    public void test_processCallback_withSpacesAndPunctuationInTheEmailKeepsItExactly() {
+        assertEmailKept("first last@example.com", "first last@example.com");
+        assertEmailKept("o'brien+tag@example.com", "o'brien+tag@example.com");
+    }
+
+    @Test
+    public void test_processCallback_withLettersOfOtherScriptsInTheEmailKeepsItExactly() {
+        assertEmailKept("Zo\\u00eb \\u5c71\\u7530@example.com", "Zo\u00eb \u5c71\u7530@example.com");
+    }
+
+    @Test
+    public void test_processCallback_withANoBreakSpaceAndASupplementaryCharacterInTheEmailKeepsItExactly() {
+        assertEmailKept("a\\u00a0b\\ud83d\\ude00@example.com", "a\u00a0b\uD83D\uDE00@example.com");
+    }
+
+    @Test
+    public void test_describeControlCharacter_findsEveryControlAndSeparatorCharacter() {
+        for (final String bad : new String[] { "\u0000", "\u0001", "\t", "\n", "\r", "\u001f", "\u007f", "\u0085", "\u009f", "\u2028",
+                "\u2029" }) {
+            final String described = OpenIdConnectAuthenticator.describeControlCharacter("ab" + bad + "cd");
+            assertEquals(String.format("the control character U+%04X at position 2 of 5", (int) bad.charAt(0)), described);
+        }
+        assertEquals("the control character U+000A at position 0 of 1", OpenIdConnectAuthenticator.describeControlCharacter("\n"));
+        // after a supplementary character the position is that of the char in the string
+        assertEquals("the control character U+0009 at position 2 of 3",
+                OpenIdConnectAuthenticator.describeControlCharacter("\uD83D\uDE00\t"));
+    }
+
+    @Test
+    public void test_describeControlCharacter_leavesOrdinaryNamesAlone() {
+        assertNull(OpenIdConnectAuthenticator.describeControlCharacter(null));
+        assertNull(OpenIdConnectAuthenticator.describeControlCharacter(""));
+        for (final String name : new String[] { "alice@example.com", "first last", "o'brien+tag@example.com", "Zo\u00eb \u5c71\u7530",
+                "a\u00a0b", "a\u200bb", "emoji\uD83D\uDE00" }) {
+            assertNull(OpenIdConnectAuthenticator.describeControlCharacter(name), name);
+        }
+    }
 }
