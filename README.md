@@ -154,6 +154,8 @@ registers the logged-in user with the session store, so a login started on one n
 another and the user stays logged in on all of them. Only the user name, groups and roles are
 stored; no token of the login is. Run the same plugins on every node: the stored format depends on
 the registered classes, and a node with a different set does not read the sessions of the others.
+This needs the plugin 15.10 on every node. Adding or removing an SSO plugin changes that set, so it
+invalidates the stored sessions: users log in again.
 A login has to be completed within 10 minutes of its authorization request.
 
 The `SsoAuthenticator` interface, `SsoManager`, `SsoAction` and the SSO section of the
