@@ -220,8 +220,10 @@ public class OpenIdConnectAuthenticator implements SsoAuthenticator {
                     final String code = request.getParameter("code");
                     final String reqState = request.getParameter("state");
                     if (logger.isDebugEnabled()) {
-                        logger.debug("code: {}, state(request): {}, state(session): {}", sanitizeForLog(code), sanitizeForLog(reqState),
-                                sesState);
+                        // Neither the authorization code nor the state is written: both are credentials of this
+                        // login until the callback is answered, and the code is a bearer secret until redeemed.
+                        logger.debug("callback: code present={}, state matches the session's={}", StringUtil.isNotBlank(code),
+                                sesState.equals(reqState));
                     }
                     if (expired) {
                         logger.warn("The OpenID Connect callback came more than {} seconds after the authorization request.",

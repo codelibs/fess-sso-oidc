@@ -621,11 +621,33 @@ public class OpenIdConnectAuthenticatorTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_getLoginCredential_callbackCodeAndStateCannotStartALogLine() {
+    public void test_getLoginCredential_callbackCodeAndStateAreNotLogged() {
+        // The code is a bearer secret until it is redeemed and the state is the credential of the login
+        // until the callback is answered, so the debug line says only that they are there and whether
+        // the state matches. A line break in either must not reach the log either.
         final List<String> messages = loggedWhileHandling("the-state\n" + FORGED_LINE, "a-code\n" + FORGED_LINE, null, null);
 
         assertSingleLine(messages);
-        assertTrue(String.join("\n", messages).contains("a-code?" + FORGED_LINE), "the code was not logged");
+        final String all = String.join("\n", messages);
+        assertTrue(all.contains("callback: code present=true, state matches the session's=false"), "the callback line is missing: " + all);
+        assertFalse(all.contains("a-code"), "the authorization code was logged: " + all);
+        assertFalse(all.contains("the-state"), "the state was logged: " + all);
+        assertFalse(all.contains(FORGED_LINE), "a value of the request was logged: " + all);
+    }
+
+    @Test
+    public void test_getLoginCredential_callbackLineReportsPresenceAndMatch() {
+        // The control of the test above: the line is there at debug, and it follows the request.
+        final List<String> matching = loggedWhileHandling("the-state", "a-code", null, null);
+        assertTrue(String.join("\n", matching).contains("callback: code present=true, state matches the session's=true"),
+                matching.toString());
+    }
+
+    @Test
+    public void test_getLoginCredential_callbackLineReportsAMissingCode() {
+        final List<String> withoutCode = loggedWhileHandling("the-state", null, null, null);
+        assertTrue(String.join("\n", withoutCode).contains("callback: code present=false, state matches the session's=true"),
+                withoutCode.toString());
     }
 
     @Test
